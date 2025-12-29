@@ -1,7 +1,7 @@
 //! This example shows how to read-back and load model states to archive
 //! session management (e.g., retrying) in a conversational application.
 
-use std::{io::Write, path::PathBuf};
+use std::{io::Write, path::PathBuf, time::Instant};
 
 use anyhow::Result;
 use clap::{Args, Parser};
@@ -16,6 +16,7 @@ use tokio::{
     fs::File,
     io::{AsyncReadExt, BufReader},
 };
+use web_rwkv::runtime::gguf::GgufReader;
 use web_rwkv::{
     context::{Context, ContextBuilder, InstanceExt},
     runtime::{
@@ -203,22 +204,17 @@ async fn main() -> Result<()> {
 
     let tokenizer = load_tokenizer().await?;
 
-    let file = File::open(cli.model).await?;
+    let file = File::open(&cli.model).await?;
     let data = unsafe { Mmap::map(&file)? };
 
-    let model = SafeTensors::deserialize(&data)?;
-    let info = Loader::info(&model)?;
-    log::info!("{:#?}", info);
-
-    let context = create_context(&info, cli.adapter).await?;
-    log::info!("{:#?}", context.adapter.get_info());
+    let is_gguf = cli.model.extension().map_or(false, |ext| ext == "gguf");
 
     let quant = (0..cli.quant)
         .map(|layer| (layer, Quant::Int8))
         .chain((0..cli.quant_nf4).map(|layer| (layer, Quant::NF4)))
         .chain((0..cli.quant_sf4).map(|layer| (layer, Quant::SF4)))
         .collect();
-    let lora = match cli.lora {
+    let lora_data = match cli.lora {
         Some(path) => {
             let file = File::open(path).await?;
             let mut reader = BufReader::new(file);
@@ -229,46 +225,102 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    let builder = ModelBuilder::new(&context, model).quant(quant);
-    let builder = match &lora {
-        Some(data) => {
-            let data = SafeTensors::deserialize(data)?;
-            let blend = Default::default();
-            let lora = Lora { data, blend };
-            builder.lora(lora)
+    let (info, context, (runtime, state)) = if is_gguf {
+        if lora_data.is_some() {
+            log::warn!("LoRA is not supported with GGUF models, ignoring --lora argument");
         }
-        None => builder,
-    };
 
-    let (runtime, state): (Box<dyn Runtime<Rnn>>, Box<dyn State>) = match info.version {
-        ModelVersion::V4 => {
-            let model = builder.build_v4().await?;
-            let bundle = v4::Bundle::<f16>::new(model, 1);
-            let state = bundle.state();
-            let runtime = TokioRuntime::new(bundle).await;
-            (Box::new(runtime), Box::new(state))
-        }
-        ModelVersion::V5 => {
-            let model = builder.build_v5().await?;
-            let bundle = v5::Bundle::<f16>::new(model, 1);
-            let state = bundle.state();
-            let runtime = TokioRuntime::new(bundle).await;
-            (Box::new(runtime), Box::new(state))
-        }
-        ModelVersion::V6 => {
-            let model = builder.build_v6().await?;
-            let bundle = v6::Bundle::<f16>::new(model, 1);
-            let state = bundle.state();
-            let runtime = TokioRuntime::new(bundle).await;
-            (Box::new(runtime), Box::new(state))
-        }
-        ModelVersion::V7 => {
-            let model = builder.build_v7().await?;
-            let bundle = v7::Bundle::<f16>::new(model, 1);
-            let state = bundle.state();
-            let runtime = TokioRuntime::new(bundle).await;
-            (Box::new(runtime), Box::new(state))
-        }
+        let model = GgufReader::new(&data).expect("failed to parse GGUF file");
+        log::info!("Loading GGUF model...");
+        let info = Loader::info(&model)?;
+        log::info!("{:#?}", info);
+
+        let context = create_context(&info, cli.adapter).await?;
+        log::info!("{:#?}", context.adapter.get_info());
+
+        let builder = ModelBuilder::new(&context, model).quant(quant);
+        let result: Result<(Box<dyn Runtime<Rnn>>, Box<dyn State>)> = match info.version {
+            ModelVersion::V4 => {
+                let model = builder.build_v4().await?;
+                let bundle = v4::Bundle::<f16>::new(model, 1);
+                let state = bundle.state();
+                let runtime = TokioRuntime::new(bundle).await;
+                Ok((Box::new(runtime), Box::new(state)))
+            }
+            ModelVersion::V5 => {
+                let model = builder.build_v5().await?;
+                let bundle = v5::Bundle::<f16>::new(model, 1);
+                let state = bundle.state();
+                let runtime = TokioRuntime::new(bundle).await;
+                Ok((Box::new(runtime), Box::new(state)))
+            }
+            ModelVersion::V6 => {
+                let model = builder.build_v6().await?;
+                let bundle = v6::Bundle::<f16>::new(model, 1);
+                let state = bundle.state();
+                let runtime = TokioRuntime::new(bundle).await;
+                Ok((Box::new(runtime), Box::new(state)))
+            }
+            ModelVersion::V7 => {
+                let model = builder.build_v7().await?;
+                let bundle = v7::Bundle::<f16>::new(model, 1);
+                let state = bundle.state();
+                let runtime = TokioRuntime::new(bundle).await;
+                Ok((Box::new(runtime), Box::new(state)))
+            }
+        };
+        (info, context, result?)
+    } else {
+        let model = SafeTensors::deserialize(&data)?;
+        log::info!("Loading SafeTensors model...");
+        let info = Loader::info(&model)?;
+        log::info!("{:#?}", info);
+
+        let context = create_context(&info, cli.adapter).await?;
+        log::info!("{:#?}", context.adapter.get_info());
+
+        let builder = ModelBuilder::new(&context, model).quant(quant);
+        let builder = match &lora_data {
+            Some(data) => {
+                let data = SafeTensors::deserialize(data)?;
+                let blend = Default::default();
+                let lora = Lora { data, blend };
+                builder.lora(lora)
+            }
+            None => builder,
+        };
+
+        let result: Result<(Box<dyn Runtime<Rnn>>, Box<dyn State>)> = match info.version {
+            ModelVersion::V4 => {
+                let model = builder.build_v4().await?;
+                let bundle = v4::Bundle::<f16>::new(model, 1);
+                let state = bundle.state();
+                let runtime = TokioRuntime::new(bundle).await;
+                Ok((Box::new(runtime), Box::new(state)))
+            }
+            ModelVersion::V5 => {
+                let model = builder.build_v5().await?;
+                let bundle = v5::Bundle::<f16>::new(model, 1);
+                let state = bundle.state();
+                let runtime = TokioRuntime::new(bundle).await;
+                Ok((Box::new(runtime), Box::new(state)))
+            }
+            ModelVersion::V6 => {
+                let model = builder.build_v6().await?;
+                let bundle = v6::Bundle::<f16>::new(model, 1);
+                let state = bundle.state();
+                let runtime = TokioRuntime::new(bundle).await;
+                Ok((Box::new(runtime), Box::new(state)))
+            }
+            ModelVersion::V7 => {
+                let model = builder.build_v7().await?;
+                let bundle = v7::Bundle::<f16>::new(model, 1);
+                let state = bundle.state();
+                let runtime = TokioRuntime::new(bundle).await;
+                Ok((Box::new(runtime), Box::new(state)))
+            }
+        };
+        (info, context, result?)
     };
 
     println!("\n\nInstructions:\n\n+: Alternative reply\n-: Exit chatting\n\n------------");
@@ -336,6 +388,11 @@ async fn main() -> Result<()> {
         inference.batches[0].append(tokens);
 
         // inference loop: read the user prompt and generate until the stop token "\n\n"
+        let mut token_count = 0u64;
+        let start_time = Instant::now();
+        let mut first_token_time: Option<Instant> = None;
+
+        // inference loop: read the user prompt and generate until the stop token "\n\n"
         loop {
             let input = inference.clone();
             let (input, output) = runtime.infer(input).await?;
@@ -346,6 +403,11 @@ async fn main() -> Result<()> {
             if output.size() == 0 {
                 // we are not finishing reading the prompt
                 continue;
+            }
+
+            // Record time of first token (after prompt processing)
+            if first_token_time.is_none() {
+                first_token_time = Some(Instant::now());
             }
 
             let output = output.to_vec();
@@ -359,6 +421,9 @@ async fn main() -> Result<()> {
             let word = String::from_utf8_lossy(&decoded);
 
             model_text += &word;
+            token_count += 1;
+
+            // Stream output immediately
             print!("{}", word);
             std::io::stdout().flush()?;
 
@@ -367,6 +432,23 @@ async fn main() -> Result<()> {
             if model_text.contains("\n\n") {
                 break;
             }
+        }
+
+        // Print performance stats
+        let total_time = start_time.elapsed();
+        let generation_time = first_token_time.map(|t| t.elapsed()).unwrap_or(total_time);
+        let prefill_time = first_token_time
+            .map(|t| t.duration_since(start_time))
+            .unwrap_or_default();
+
+        if token_count > 0 {
+            let tokens_per_sec = token_count as f64 / generation_time.as_secs_f64();
+            println!(
+                "\n[{} tokens, {:.1} tok/s, prefill: {:.0}ms]",
+                token_count,
+                tokens_per_sec,
+                prefill_time.as_secs_f64() * 1000.0
+            );
         }
     }
 

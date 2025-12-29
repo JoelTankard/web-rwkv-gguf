@@ -6,6 +6,7 @@ use futures::future::BoxFuture;
 use futures::future::LocalBoxFuture;
 use thiserror::Error;
 
+pub mod gguf;
 pub mod infer;
 pub mod loader;
 pub mod model;

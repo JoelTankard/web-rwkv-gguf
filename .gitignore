@@ -6,3 +6,5 @@
 Cargo.lock
 *.st
 *.safetensors
+*.gguf
+*.pth

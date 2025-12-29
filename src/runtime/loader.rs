@@ -95,6 +95,36 @@ impl<T: Scalar> TensorFromReader<T> for TensorCpu<T> {
     }
 }
 
+pub fn tensor_f16_from_reader(reader: ReaderTensor) -> Result<TensorCpu<f16>, TensorError> {
+    let (dt, shape, data) = reader;
+    let shape = Shape::from_slice_rev(&shape)?;
+
+    match dt {
+        Dtype::F16 => match data {
+            Cow::Borrowed(data) => TensorCpu::from_data(shape, bytemuck::cast_slice(data)),
+            Cow::Owned(data) => {
+                let data = bytemuck::cast_slice(&data);
+                let data = Cow::Owned(data.to_vec());
+                TensorCpu::from_data(shape, data)
+            }
+        },
+        Dtype::F32 => {
+            let f32_data: &[f32] = bytemuck::cast_slice(&data);
+            let f16_data: Vec<f16> = f32_data.iter().map(|&x| f16::from_f32(x)).collect();
+            TensorCpu::from_data(shape, f16_data)
+        }
+        Dtype::BF16 => {
+            let bf16_data: &[half::bf16] = bytemuck::cast_slice(&data);
+            let f16_data: Vec<f16> = bf16_data
+                .iter()
+                .map(|x| f16::from_f32(x.to_f32()))
+                .collect();
+            TensorCpu::from_data(shape, f16_data)
+        }
+        _ => Err(TensorErrorKind::Type)?,
+    }
+}
+
 /// A LoRA that adds to the model when loading.
 #[derive(Clone)]
 pub struct Lora<R> {
@@ -247,7 +277,7 @@ impl<R: Reader> Loader<R> {
         ]
         .into_iter()
         .all(|name| model.contains(name));
-        let v7 = [
+        let v7_separate = [
             "blocks.0.att.x_r",
             "blocks.0.att.x_w",
             "blocks.0.att.x_k",
@@ -268,6 +298,23 @@ impl<R: Reader> Loader<R> {
         ]
         .into_iter()
         .all(|name| model.contains(name));
+        let v7_fused = [
+            "blocks.0.att.time_maa",
+            "blocks.0.att.w0",
+            "blocks.0.att.w1",
+            "blocks.0.att.w2",
+            "blocks.0.att.a0",
+            "blocks.0.att.a1",
+            "blocks.0.att.a2",
+            "blocks.0.att.g1",
+            "blocks.0.att.g2",
+            "blocks.0.att.r_k",
+            "blocks.0.att.k_k",
+            "blocks.0.att.k_a",
+        ]
+        .into_iter()
+        .all(|name| model.contains(name));
+        let v7 = v7_separate || v7_fused;
 
         let version = match (v4, v5, v6, v7) {
             (true, false, false, false) => ModelVersion::V4,
@@ -393,7 +440,7 @@ impl<R: Reader> Loader<R> {
     ) -> Result<TensorGpu<f32, ReadWrite>, LoaderError> {
         let context = &self.context;
         let tensor = self.model.tensor(name.as_ref())?;
-        let tensor: TensorGpu<_, _> = TensorCpu::<f16>::from_reader(tensor)?
+        let tensor: TensorGpu<_, _> = tensor_f16_from_reader(tensor)?
             .map(|x| x.to_f32())
             .reshape(
                 TensorDimension::Auto,
@@ -430,7 +477,7 @@ impl<R: Reader> Loader<R> {
     ) -> Result<TensorGpu<f32, ReadWrite>, LoaderError> {
         let context = &self.context;
         let tensor = self.model.tensor(name.as_ref())?;
-        let tensor: TensorGpu<_, _> = TensorCpu::<f16>::from_reader(tensor)?
+        let tensor: TensorGpu<_, _> = tensor_f16_from_reader(tensor)?
             // .map(|x| -x.to_f32().exp())
             .map(|x| x.to_f32())
             .reshape(
@@ -471,7 +518,7 @@ impl<R: Reader> Loader<R> {
     ) -> Result<TensorGpu<f32, ReadWrite>, LoaderError> {
         let context = &self.context;
         let tensor = self.model.tensor(name.as_ref())?;
-        let tensor: TensorGpu<_, _> = TensorCpu::<f16>::from_reader(tensor)?
+        let tensor: TensorGpu<_, _> = tensor_f16_from_reader(tensor)?
             // .map(|x| -x.to_f32().exp())
             // .map(|x| x.exp())
             .map(|x| x.to_f32())
@@ -515,7 +562,7 @@ impl<R: Reader> Loader<R> {
         let lora = self.lora_vectors(name.as_ref())?;
         let tensor = self.model.tensor(name.as_ref())?;
         let tensor = if lora.is_empty() {
-            TensorCpu::from_reader(tensor)?
+            tensor_f16_from_reader(tensor)?
                 .reshape(
                     TensorDimension::Auto,
                     TensorDimension::Size(1),
@@ -524,7 +571,7 @@ impl<R: Reader> Loader<R> {
                 )?
                 .to(context)
         } else {
-            let tensor_f32: TensorGpu<f32, _> = TensorCpu::<f16>::from_reader(tensor)?
+            let tensor_f32: TensorGpu<f32, _> = tensor_f16_from_reader(tensor)?
                 .map(|x| x.to_f32())
                 .reshape(
                     TensorDimension::Auto,
@@ -567,7 +614,7 @@ impl<R: Reader> Loader<R> {
     ) -> Result<TensorGpu<f16, ReadWrite>, LoaderError> {
         let context = &self.context;
         let tensor = self.model.tensor(name.as_ref())?;
-        let tensor: TensorGpu<_, _> = TensorCpu::from_reader(tensor)?.to(context);
+        let tensor: TensorGpu<_, _> = tensor_f16_from_reader(tensor)?.to(context);
 
         let mut ops = vec![];
         for lora in self.lora_matrices(name.as_ref())? {
@@ -594,7 +641,7 @@ impl<R: Reader> Loader<R> {
     ) -> Result<TensorGpu<f16, ReadWrite>, LoaderError> {
         let context = &self.context;
         let tensor = self.model.tensor(name.as_ref())?;
-        let tensor: TensorGpu<_, _> = TensorCpu::<f16>::from_reader(tensor)?
+        let tensor: TensorGpu<_, _> = tensor_f16_from_reader(tensor)?
             .map(|x| f16::from_f32(discount * x.to_f32()))
             .to(context);
 
@@ -623,7 +670,7 @@ impl<R: Reader> Loader<R> {
     ) -> Result<(), LoaderError> {
         let context = &self.context;
         let tensor = self.model.tensor(name.as_ref())?;
-        let tensor = TensorCpu::from_reader(tensor)?;
+        let tensor = tensor_f16_from_reader(tensor)?;
         matrix.load(&tensor)?;
 
         let mut ops = vec![];
@@ -653,7 +700,7 @@ impl<R: Reader> Loader<R> {
         let context = &self.context;
 
         let tensor = self.model.tensor(name.as_ref())?;
-        let tensor = TensorCpu::<f16>::from_reader(tensor)?
+        let tensor = tensor_f16_from_reader(tensor)?
             .map(|x| f16::from_f32(discount * x.to_f32()))
             .reshape(
                 TensorDimension::Full,
@@ -685,8 +732,8 @@ impl<R: Reader> Loader<R> {
         &self,
         name: impl AsRef<str>,
     ) -> Result<TensorCpu<f16>, LoaderError> {
-        let (dt, shape, tensor) = self.model.tensor(name.as_ref())?;
-        let tensor = TensorCpu::from_reader((dt, shape, tensor))?.pad(PAD_MAT);
+        let tensor = self.model.tensor(name.as_ref())?;
+        let tensor = tensor_f16_from_reader(tensor)?.pad(PAD_MAT);
         Ok(tensor)
     }
 
@@ -695,10 +742,8 @@ impl<R: Reader> Loader<R> {
         name: impl AsRef<str>,
     ) -> Result<TensorGpu<f16, ReadWrite>, LoaderError> {
         let context = &self.context;
-        let (dt, shape, tensor) = self.model.tensor(name.as_ref())?;
-        let tensor = TensorCpu::from_reader((dt, shape, tensor))?
-            .pad(PAD_MAT)
-            .to(context);
+        let tensor = self.model.tensor(name.as_ref())?;
+        let tensor = tensor_f16_from_reader(tensor)?.pad(PAD_MAT).to(context);
         Ok(tensor)
     }
 
