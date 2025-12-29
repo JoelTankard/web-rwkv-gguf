@@ -46,6 +46,12 @@ pub trait Reader {
     fn contains(&self, name: &str) -> bool;
     fn shape(&self, name: &str) -> Result<Vec<usize>, SafeTensorError>;
     fn tensor(&self, name: &str) -> Result<ReaderTensor<'_>, SafeTensorError>;
+
+    /// Get raw quantized tensor data for direct loading (bypasses dequantization).
+    /// Returns (ggml_type_id, raw_data) if the tensor is quantized, None otherwise.
+    fn quantized_tensor(&self, _name: &str) -> Option<(u32, &[u8])> {
+        None
+    }
 }
 
 impl Reader for SafeTensors<'_> {
@@ -749,6 +755,16 @@ impl<R: Reader> Loader<R> {
 
     pub fn load_matrix(&self, name: String, quant: Quant) -> Result<Matrix, LoaderError> {
         let context = &self.context;
+
+        // Try direct quantized loading for GGUF tensors (bypasses F16 staging)
+        if let Some((gguf_type, raw_data)) = self.model.quantized_tensor(&name) {
+            if let Some(matrix) =
+                self.try_load_matrix_direct(context, &name, gguf_type, raw_data, quant)?
+            {
+                return Ok(matrix);
+            }
+        }
+
         match quant {
             Quant::None => Ok(Matrix::Fp16(self.load_matrix_f16(name)?)),
             Quant::Int8 => {
@@ -769,6 +785,109 @@ impl<R: Reader> Loader<R> {
                 self.load_in_place_matrix_f16(&buffer, &name)?;
                 Ok(Matrix::quant_sf4(&buffer, 5.0)?)
             }
+        }
+    }
+
+    /// Try to load a matrix directly from GGUF quantized data without F16 staging.
+    /// Returns None if direct loading is not supported for this combination.
+    fn try_load_matrix_direct(
+        &self,
+        context: &Context,
+        name: &str,
+        gguf_type: u32,
+        raw_data: &[u8],
+        quant: Quant,
+    ) -> Result<Option<Matrix>, LoaderError> {
+        use super::gguf::{
+            repack_q4_0_to_nf4, repack_q4_k_to_int8, repack_q5_k_to_int8, repack_q6_k_to_int8,
+            repack_q8_0_to_int8, GgmlType,
+        };
+        use crate::tensor::matrix::Float4Quant;
+
+        let shape = self.tensor_shape(name)?;
+        let num_elements = shape.len();
+
+        match (GgmlType::from(gguf_type), quant) {
+            (GgmlType::Q8_0, Quant::Int8) => {
+                // Direct Q8_0 -> Int8 repacking
+                let (weights, minmax) = repack_q8_0_to_int8(raw_data, num_elements);
+
+                // Create GPU tensors
+                let w: TensorGpu<u8, ReadWrite> = TensorCpu::from_data(shape, weights)?.to(context);
+                let m_shape = Shape::new(minmax.len(), 1, 1, 1);
+                let m: TensorGpu<f16, ReadWrite> =
+                    TensorCpu::from_data(m_shape, minmax)?.to(context);
+
+                log::info!("direct load (Q8_0 -> Int8): {name}");
+                Ok(Some(Matrix::Int8 { w, m }))
+            }
+            (GgmlType::Q4K, Quant::Int8) => {
+                // Calculate actual elements from raw data size (Q4_K: 144 bytes per 256 elements)
+                let actual_elements = (raw_data.len() / 144) * 256;
+                if actual_elements != num_elements || num_elements % 256 != 0 {
+                    return Ok(None); // Fall back to F16 path
+                }
+                let (weights, minmax) = repack_q4_k_to_int8(raw_data, num_elements);
+
+                let w: TensorGpu<u8, ReadWrite> = TensorCpu::from_data(shape, weights)?.to(context);
+                let m_shape = Shape::new(minmax.len(), 1, 1, 1);
+                let m: TensorGpu<f16, ReadWrite> =
+                    TensorCpu::from_data(m_shape, minmax)?.to(context);
+
+                log::info!("direct load (Q4_K -> Int8): {name}");
+                Ok(Some(Matrix::Int8 { w, m }))
+            }
+            (GgmlType::Q5K, Quant::Int8) => {
+                // Calculate actual elements from raw data size (Q5_K: 176 bytes per 256 elements)
+                let actual_elements = (raw_data.len() / 176) * 256;
+                if actual_elements != num_elements || num_elements % 256 != 0 {
+                    return Ok(None); // Fall back to F16 path
+                }
+                let (weights, minmax) = repack_q5_k_to_int8(raw_data, num_elements);
+
+                let w: TensorGpu<u8, ReadWrite> = TensorCpu::from_data(shape, weights)?.to(context);
+                let m_shape = Shape::new(minmax.len(), 1, 1, 1);
+                let m: TensorGpu<f16, ReadWrite> =
+                    TensorCpu::from_data(m_shape, minmax)?.to(context);
+
+                log::info!("direct load (Q5_K -> Int8): {name}");
+                Ok(Some(Matrix::Int8 { w, m }))
+            }
+            (GgmlType::Q6K, Quant::Int8) => {
+                // Calculate actual elements from raw data size (Q6_K: 210 bytes per 256 elements)
+                let actual_elements = (raw_data.len() / 210) * 256;
+                if actual_elements != num_elements || num_elements % 256 != 0 {
+                    return Ok(None); // Fall back to F16 path
+                }
+                let (weights, minmax) = repack_q6_k_to_int8(raw_data, num_elements);
+
+                let w: TensorGpu<u8, ReadWrite> = TensorCpu::from_data(shape, weights)?.to(context);
+                let m_shape = Shape::new(minmax.len(), 1, 1, 1);
+                let m: TensorGpu<f16, ReadWrite> =
+                    TensorCpu::from_data(m_shape, minmax)?.to(context);
+
+                log::info!("direct load (Q6_K -> Int8): {name}");
+                Ok(Some(Matrix::Int8 { w, m }))
+            }
+            (GgmlType::Q4_0, Quant::NF4) => {
+                // Direct Q4_0 -> NF4 repacking
+                let (weights, absmax) = repack_q4_0_to_nf4(raw_data, num_elements);
+
+                // Create GPU tensors
+                let matrix_shape = Shape::new(shape[0] / 2, shape[1], shape[2], shape[3]);
+                let w: TensorGpu<u8, ReadWrite> =
+                    TensorCpu::from_data(matrix_shape, weights)?.to(context);
+
+                let m_shape = Shape::new(absmax.len(), 1, 1, 1);
+                let m: TensorGpu<f16, ReadWrite> =
+                    TensorCpu::from_data(m_shape, absmax)?.to(context);
+
+                let q = Float4Quant::default().0.to(context);
+
+                log::info!("direct load (Q4_0 -> NF4): {name}");
+                Ok(Some(Matrix::Fp4 { w, q, m }))
+            }
+            _ => Ok(None), // Fall through to F16 path
         }
     }
 

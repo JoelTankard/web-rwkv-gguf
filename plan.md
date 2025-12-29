@@ -59,16 +59,17 @@ Peak VRAM: Quantized only
 -   [x] Implement Q2_K dequantization
 -   [ ] Update conversion script to support K-quants
 
-### Phase 5: Direct GPU Quantized Loading (Future Optimization)
+### Phase 5: Direct GPU Quantized Loading ✅
 
--   [ ] Analyze block size differences:
+-   [x] Analyze block size differences:
     -   GGUF Q8_0: 32 elements/block (34 bytes: 2B scale + 32B data)
-    -   web-rwkv Int8: 128 elements/block (different scale layout)
--   [ ] Option A: Repack GGUF Q8_0 → web-rwkv Int8 on CPU (still saves F16 staging)
--   [ ] Option B: New GPU shader for GGUF Q8_0 block format
--   [ ] Option C: Modify web-rwkv quantization to match GGUF block sizes
--   [ ] Add `load_matrix_quantized_direct` methods to `Loader`
--   [ ] Bypass F16 staging entirely for compatible types
+    -   web-rwkv Int8: 128 elements/block (min/max per block)
+-   [x] Option A: Repack GGUF Q8_0 → web-rwkv Int8 on CPU (saves F16 staging)
+-   [x] Repack GGUF Q4_0 → web-rwkv NF4 on CPU
+-   [x] Repack GGUF K-quants (Q4_K, Q5_K, Q6_K) → web-rwkv Int8 on CPU
+-   [x] Add `quantized_tensor` method to Reader trait
+-   [x] Add `try_load_matrix_direct` to Loader for direct quantized loading
+-   [x] Bypass F16 staging for Q8_0→Int8, Q4_0→NF4, and K-quants→Int8
 
 ### Phase 6: Integration & Testing ✅
 
@@ -170,13 +171,14 @@ _Note: Actual RWKV GGUF naming may vary - will verify with real files._
 -   F32/BF16 → F16 conversion during tensor loading
 -   Q8_0/Q4_0 → F16 dequantization during tensor loading (supports pre-quantized GGUF models)
 -   K-quant dequantization (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K) → F16 for better compression ratios
+-   Direct quantized loading: Q8_0/Q4_K/Q5_K/Q6_K → Int8, Q4_0 → NF4 (bypasses F16 staging)
 -   Chat example updated with streaming output and tokens/second display
 -   Benchmark example (`bench_format`) for comparing .st vs .gguf performance
 -   All tests passing, model produces coherent output
 
 **Pending:**
 
--   Direct GPU loading to bypass F16 staging (future optimization)
+-   Update conversion script to support K-quants
 
 ## Benchmark Results (M2 Max, 0.1B model)
 
@@ -200,7 +202,7 @@ _Note: Actual RWKV GGUF naming may vary - will verify with real files._
 -   [x] No performance regression (~140 tok/s on M2 Max)
 -   [x] Load RWKV pre-quantized GGUF models (Q8_0, Q4_0) via dequantization
 -   [x] K-quant support (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)
--   [ ] Direct quantized loading to bypass F16 staging (future optimization)
+-   [x] Direct quantized loading to bypass F16 staging (Q8_0→Int8, Q4_0→NF4)
 
 ## Usage
 

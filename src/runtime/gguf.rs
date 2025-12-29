@@ -422,6 +422,438 @@ fn dequantize_q2_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
     output
 }
 
+/// Repack GGUF Q8_0 data to web-rwkv Int8 format.
+/// GGUF Q8_0: 32 elements/block, [scale: f16, data: i8[32]] = 34 bytes
+/// web-rwkv Int8: 128 elements/block, [weights: u8[128]], separate [min, max] per block
+/// Returns (weights, minmax) where minmax is interleaved [min0, max0, min1, max1, ...]
+pub fn repack_q8_0_to_int8(data: &[u8], num_elements: usize) -> (Vec<u8>, Vec<f16>) {
+    const GGUF_BLOCK_SIZE: usize = 32;
+    const GGUF_BLOCK_BYTES: usize = 34;
+    const RWKV_BLOCK_SIZE: usize = 128;
+
+    let num_gguf_blocks = num_elements / GGUF_BLOCK_SIZE;
+    let num_rwkv_blocks = num_elements / RWKV_BLOCK_SIZE;
+
+    let mut weights = Vec::with_capacity(num_elements);
+    let mut minmax = Vec::with_capacity(num_rwkv_blocks * 2);
+
+    // Process 4 GGUF blocks at a time to make 1 web-rwkv block
+    for rwkv_block_idx in 0..num_rwkv_blocks {
+        let gguf_start = rwkv_block_idx * 4;
+
+        // First pass: find min/max across 4 GGUF blocks (128 elements)
+        let mut min_val = f32::MAX;
+        let mut max_val = f32::MIN;
+
+        for i in 0..4 {
+            let block_offset = (gguf_start + i) * GGUF_BLOCK_BYTES;
+            let scale = f16::from_le_bytes([data[block_offset], data[block_offset + 1]]).to_f32();
+
+            for j in 0..GGUF_BLOCK_SIZE {
+                let q = data[block_offset + 2 + j] as i8;
+                let val = (q as f32) * scale;
+                min_val = min_val.min(val);
+                max_val = max_val.max(val);
+            }
+        }
+
+        // Store min/max for this block
+        minmax.push(f16::from_f32(min_val));
+        minmax.push(f16::from_f32(max_val));
+
+        // Second pass: rescale values to 0-255 range
+        let range = max_val - min_val;
+        let inv_range = if range > 0.0 { 255.0 / range } else { 0.0 };
+
+        for i in 0..4 {
+            let block_offset = (gguf_start + i) * GGUF_BLOCK_BYTES;
+            let scale = f16::from_le_bytes([data[block_offset], data[block_offset + 1]]).to_f32();
+
+            for j in 0..GGUF_BLOCK_SIZE {
+                let q = data[block_offset + 2 + j] as i8;
+                let val = (q as f32) * scale;
+                let normalized = ((val - min_val) * inv_range).round() as u8;
+                weights.push(normalized);
+            }
+        }
+    }
+
+    // Handle remaining elements if num_elements is not divisible by 128
+    let remaining_start = num_rwkv_blocks * 4;
+    if remaining_start < num_gguf_blocks {
+        let mut min_val = f32::MAX;
+        let mut max_val = f32::MIN;
+        let mut temp_vals = Vec::new();
+
+        for i in remaining_start..num_gguf_blocks {
+            let block_offset = i * GGUF_BLOCK_BYTES;
+            let scale = f16::from_le_bytes([data[block_offset], data[block_offset + 1]]).to_f32();
+
+            for j in 0..GGUF_BLOCK_SIZE {
+                let q = data[block_offset + 2 + j] as i8;
+                let val = (q as f32) * scale;
+                min_val = min_val.min(val);
+                max_val = max_val.max(val);
+                temp_vals.push(val);
+            }
+        }
+
+        if !temp_vals.is_empty() {
+            minmax.push(f16::from_f32(min_val));
+            minmax.push(f16::from_f32(max_val));
+
+            let range = max_val - min_val;
+            let inv_range = if range > 0.0 { 255.0 / range } else { 0.0 };
+
+            for val in temp_vals {
+                let normalized = ((val - min_val) * inv_range).round() as u8;
+                weights.push(normalized);
+            }
+
+            // Pad to 128 elements
+            while weights.len() % RWKV_BLOCK_SIZE != 0 {
+                weights.push(0);
+            }
+        }
+    }
+
+    (weights, minmax)
+}
+
+/// Repack GGUF Q4_0 data to web-rwkv NF4 format.
+/// GGUF Q4_0: 32 elements/block, [scale: f16, data: u8[16]] = 18 bytes (4-bit packed)
+/// web-rwkv NF4: 64 elements/block, [weights: u8[32]], separate [absmax] per block
+/// Note: NF4 uses a quantile-based lookup table, so this is an approximation.
+/// Returns (weights, absmax)
+pub fn repack_q4_0_to_nf4(data: &[u8], num_elements: usize) -> (Vec<u8>, Vec<f16>) {
+    const GGUF_BLOCK_SIZE: usize = 32;
+    const GGUF_BLOCK_BYTES: usize = 18;
+    const NF4_BLOCK_SIZE: usize = 64;
+
+    // NF4 quantile values (normalized to [-1, 1])
+    const NF4_QUANT: [f32; 16] = [
+        -1.0,
+        -0.6961928009986877,
+        -0.5250730514526367,
+        -0.39491748809814453,
+        -0.28444138169288635,
+        -0.18477343022823334,
+        -0.09105003625154495,
+        0.0,
+        0.07958029955625534,
+        0.16093020141124725,
+        0.24611230194568634,
+        0.33791524171829224,
+        0.44070982933044434,
+        0.5626170039176941,
+        0.7229568362236023,
+        1.0,
+    ];
+
+    let _num_gguf_blocks = num_elements / GGUF_BLOCK_SIZE;
+    let num_nf4_blocks = num_elements / NF4_BLOCK_SIZE;
+
+    let mut weights = Vec::with_capacity(num_elements / 2); // 4-bit packed
+    let mut absmax = Vec::with_capacity(num_nf4_blocks);
+
+    // Process 2 GGUF blocks at a time to make 1 NF4 block (64 elements)
+    for nf4_block_idx in 0..num_nf4_blocks {
+        let gguf_start = nf4_block_idx * 2;
+
+        // First pass: find absmax across 2 GGUF blocks (64 elements)
+        let mut max_abs = 0.0f32;
+
+        for i in 0..2 {
+            let block_offset = (gguf_start + i) * GGUF_BLOCK_BYTES;
+            let scale = f16::from_le_bytes([data[block_offset], data[block_offset + 1]]).to_f32();
+
+            for j in 0..16 {
+                let byte = data[block_offset + 2 + j];
+                let lo = ((byte & 0x0F) as i8 - 8) as f32 * scale;
+                let hi = (((byte >> 4) & 0x0F) as i8 - 8) as f32 * scale;
+                max_abs = max_abs.max(lo.abs()).max(hi.abs());
+            }
+        }
+
+        absmax.push(f16::from_f32(max_abs));
+
+        // Second pass: quantize to NF4
+        let inv_absmax = if max_abs > 0.0 { 1.0 / max_abs } else { 0.0 };
+
+        for i in 0..2 {
+            let block_offset = (gguf_start + i) * GGUF_BLOCK_BYTES;
+            let scale = f16::from_le_bytes([data[block_offset], data[block_offset + 1]]).to_f32();
+
+            for j in 0..16 {
+                let byte = data[block_offset + 2 + j];
+                let lo = ((byte & 0x0F) as i8 - 8) as f32 * scale;
+                let hi = (((byte >> 4) & 0x0F) as i8 - 8) as f32 * scale;
+
+                // Normalize to [-1, 1] and find closest NF4 value
+                let lo_norm = lo * inv_absmax;
+                let hi_norm = hi * inv_absmax;
+
+                let lo_idx = NF4_QUANT
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (*a - lo_norm)
+                            .abs()
+                            .partial_cmp(&(*b - lo_norm).abs())
+                            .unwrap()
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0) as u8;
+
+                let hi_idx = NF4_QUANT
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (*a - hi_norm)
+                            .abs()
+                            .partial_cmp(&(*b - hi_norm).abs())
+                            .unwrap()
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0) as u8;
+
+                // Pack two 4-bit values into one byte
+                weights.push(lo_idx | (hi_idx << 4));
+            }
+        }
+    }
+
+    (weights, absmax)
+}
+
+/// Repack GGUF Q4_K data to web-rwkv Int8 format.
+/// Q4_K: 256 elements per super-block, [d: f16, dmin: f16, scales: 12B, qs: 128B] = 144 bytes
+/// web-rwkv Int8: 128 elements/block, [weights: u8[128]], separate [min, max] per block
+pub fn repack_q4_k_to_int8(data: &[u8], num_elements: usize) -> (Vec<u8>, Vec<f16>) {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 144;
+    const RWKV_BLOCK_SIZE: usize = 128;
+
+    let num_super_blocks = num_elements / QK_K;
+    let num_rwkv_blocks = num_elements / RWKV_BLOCK_SIZE;
+
+    let mut weights = Vec::with_capacity(num_elements);
+    let mut minmax = Vec::with_capacity(num_rwkv_blocks * 2);
+
+    // Temporary buffer for dequantized values
+    let mut dequant = vec![0.0f32; QK_K];
+
+    for sb_idx in 0..num_super_blocks {
+        let block = &data[sb_idx * BLOCK_BYTES..][..BLOCK_BYTES];
+
+        let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+
+        // Dequantize all 256 elements
+        let mut is = 0usize;
+        for j in (0..QK_K).step_by(64) {
+            let (sc0, m0) = get_scale_min_k4(is, scales);
+            let (sc1, m1) = get_scale_min_k4(is + 1, scales);
+
+            let d1 = d * (sc0 as f32);
+            let m1_val = dmin * (m0 as f32);
+            let d2 = d * (sc1 as f32);
+            let m2_val = dmin * (m1 as f32);
+
+            let q_offset = j / 2;
+            for l in 0..32 {
+                let q_byte = qs[q_offset + l];
+                dequant[j + l] = d1 * ((q_byte & 0xF) as f32) - m1_val;
+                dequant[j + 32 + l] = d2 * ((q_byte >> 4) as f32) - m2_val;
+            }
+            is += 2;
+        }
+
+        // Convert to Int8 format (2 blocks of 128 elements each)
+        for block_idx in 0..2 {
+            let start = block_idx * RWKV_BLOCK_SIZE;
+            let chunk = &dequant[start..start + RWKV_BLOCK_SIZE];
+
+            let min_val = chunk.iter().cloned().fold(f32::MAX, f32::min);
+            let max_val = chunk.iter().cloned().fold(f32::MIN, f32::max);
+
+            minmax.push(f16::from_f32(min_val));
+            minmax.push(f16::from_f32(max_val));
+
+            let range = max_val - min_val;
+            let inv_range = if range > 0.0 { 255.0 / range } else { 0.0 };
+
+            for &val in chunk {
+                let normalized = ((val - min_val) * inv_range).round() as u8;
+                weights.push(normalized);
+            }
+        }
+    }
+
+    (weights, minmax)
+}
+
+/// Repack GGUF Q5_K data to web-rwkv Int8 format.
+/// Q5_K: 256 elements per super-block, [d: f16, dmin: f16, scales: 12B, qh: 32B, qs: 128B] = 176 bytes
+pub fn repack_q5_k_to_int8(data: &[u8], num_elements: usize) -> (Vec<u8>, Vec<f16>) {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 176;
+    const RWKV_BLOCK_SIZE: usize = 128;
+
+    let num_super_blocks = num_elements / QK_K;
+    let num_rwkv_blocks = num_elements / RWKV_BLOCK_SIZE;
+
+    let mut weights = Vec::with_capacity(num_elements);
+    let mut minmax = Vec::with_capacity(num_rwkv_blocks * 2);
+
+    let mut dequant = vec![0.0f32; QK_K];
+
+    for sb_idx in 0..num_super_blocks {
+        let block = &data[sb_idx * BLOCK_BYTES..][..BLOCK_BYTES];
+
+        let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
+        let scales = &block[4..16];
+        let qh = &block[16..48];
+        let ql = &block[48..176];
+
+        let mut is = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+
+        for j in (0..QK_K).step_by(64) {
+            let (sc0, m0) = get_scale_min_k4(is, scales);
+            let (sc1, m1) = get_scale_min_k4(is + 1, scales);
+
+            let d1 = d * (sc0 as f32);
+            let m1_val = dmin * (m0 as f32);
+            let d2 = d * (sc1 as f32);
+            let m2_val = dmin * (m1 as f32);
+
+            let ql_offset = j / 2;
+
+            for l in 0..32 {
+                let q_low = ql[ql_offset + l] & 0xF;
+                let q_high = if qh[l] & u1 != 0 { 16 } else { 0 };
+                dequant[j + l] = d1 * ((q_low + q_high) as f32) - m1_val;
+            }
+
+            for l in 0..32 {
+                let q_low = ql[ql_offset + l] >> 4;
+                let q_high = if qh[l] & u2 != 0 { 16 } else { 0 };
+                dequant[j + 32 + l] = d2 * ((q_low + q_high) as f32) - m2_val;
+            }
+
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+
+        // Convert to Int8 format
+        for block_idx in 0..2 {
+            let start = block_idx * RWKV_BLOCK_SIZE;
+            let chunk = &dequant[start..start + RWKV_BLOCK_SIZE];
+
+            let min_val = chunk.iter().cloned().fold(f32::MAX, f32::min);
+            let max_val = chunk.iter().cloned().fold(f32::MIN, f32::max);
+
+            minmax.push(f16::from_f32(min_val));
+            minmax.push(f16::from_f32(max_val));
+
+            let range = max_val - min_val;
+            let inv_range = if range > 0.0 { 255.0 / range } else { 0.0 };
+
+            for &val in chunk {
+                let normalized = ((val - min_val) * inv_range).round() as u8;
+                weights.push(normalized);
+            }
+        }
+    }
+
+    (weights, minmax)
+}
+
+/// Repack GGUF Q6_K data to web-rwkv Int8 format.
+/// Q6_K: 256 elements per super-block, [ql: 128B, qh: 64B, scales: 16B, d: f16] = 210 bytes
+pub fn repack_q6_k_to_int8(data: &[u8], num_elements: usize) -> (Vec<u8>, Vec<f16>) {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 210;
+    const RWKV_BLOCK_SIZE: usize = 128;
+
+    let num_super_blocks = num_elements / QK_K;
+    let num_rwkv_blocks = num_elements / RWKV_BLOCK_SIZE;
+
+    let mut weights = Vec::with_capacity(num_elements);
+    let mut minmax = Vec::with_capacity(num_rwkv_blocks * 2);
+
+    let mut dequant = vec![0.0f32; QK_K];
+
+    for sb_idx in 0..num_super_blocks {
+        let block = &data[sb_idx * BLOCK_BYTES..][..BLOCK_BYTES];
+
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let d = f16::from_le_bytes([block[208], block[209]]).to_f32();
+
+        let mut ql_idx = 0usize;
+        let mut qh_idx = 0usize;
+        let mut sc_idx = 0usize;
+        let mut out_idx = 0usize;
+
+        for _n in (0..QK_K).step_by(128) {
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[ql_idx + l] & 0xF) | (((qh[qh_idx + l] >> 0) & 3) << 4)) as i8 - 32;
+                let q2 =
+                    ((ql[ql_idx + l + 32] & 0xF) | (((qh[qh_idx + l] >> 2) & 3) << 4)) as i8 - 32;
+                let q3 = ((ql[ql_idx + l] >> 4) | (((qh[qh_idx + l] >> 4) & 3) << 4)) as i8 - 32;
+                let q4 =
+                    ((ql[ql_idx + l + 32] >> 4) | (((qh[qh_idx + l] >> 6) & 3) << 4)) as i8 - 32;
+
+                let sc0 = scales[sc_idx + is] as i8;
+                let sc2 = scales[sc_idx + is + 2] as i8;
+                let sc4 = scales[sc_idx + is + 4] as i8;
+                let sc6 = scales[sc_idx + is + 6] as i8;
+
+                dequant[out_idx + l] = d * (sc0 as f32) * (q1 as f32);
+                dequant[out_idx + l + 32] = d * (sc2 as f32) * (q2 as f32);
+                dequant[out_idx + l + 64] = d * (sc4 as f32) * (q3 as f32);
+                dequant[out_idx + l + 96] = d * (sc6 as f32) * (q4 as f32);
+            }
+
+            ql_idx += 64;
+            qh_idx += 32;
+            sc_idx += 8;
+            out_idx += 128;
+        }
+
+        // Convert to Int8 format
+        for block_idx in 0..2 {
+            let start = block_idx * RWKV_BLOCK_SIZE;
+            let chunk = &dequant[start..start + RWKV_BLOCK_SIZE];
+
+            let min_val = chunk.iter().cloned().fold(f32::MAX, f32::min);
+            let max_val = chunk.iter().cloned().fold(f32::MIN, f32::max);
+
+            minmax.push(f16::from_f32(min_val));
+            minmax.push(f16::from_f32(max_val));
+
+            let range = max_val - min_val;
+            let inv_range = if range > 0.0 { 255.0 / range } else { 0.0 };
+
+            for &val in chunk {
+                let normalized = ((val - min_val) * inv_range).round() as u8;
+                weights.push(normalized);
+            }
+        }
+    }
+
+    (weights, minmax)
+}
+
 pub const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
 pub const GGUF_VERSION: u32 = 3;
 pub const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
@@ -541,6 +973,43 @@ impl GgmlType {
             GgmlType::I64 => Some(Dtype::I64),
             GgmlType::F64 => Some(Dtype::F64),
             _ => None, // Quantized types don't map directly to Dtype
+        }
+    }
+
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            GgmlType::F32 => 0,
+            GgmlType::F16 => 1,
+            GgmlType::Q4_0 => 2,
+            GgmlType::Q4_1 => 3,
+            GgmlType::Q5_0 => 6,
+            GgmlType::Q5_1 => 7,
+            GgmlType::Q8_0 => 8,
+            GgmlType::Q8_1 => 9,
+            GgmlType::Q2K => 10,
+            GgmlType::Q3K => 11,
+            GgmlType::Q4K => 12,
+            GgmlType::Q5K => 13,
+            GgmlType::Q6K => 14,
+            GgmlType::Q8K => 15,
+            GgmlType::IQ2XXS => 16,
+            GgmlType::IQ2XS => 17,
+            GgmlType::IQ3XXS => 18,
+            GgmlType::IQ1S => 19,
+            GgmlType::IQ4NL => 20,
+            GgmlType::IQ3S => 21,
+            GgmlType::IQ2S => 22,
+            GgmlType::IQ4XS => 23,
+            GgmlType::I8 => 24,
+            GgmlType::I16 => 25,
+            GgmlType::I32 => 26,
+            GgmlType::I64 => 27,
+            GgmlType::F64 => 28,
+            GgmlType::IQ1M => 29,
+            GgmlType::BF16 => 30,
+            GgmlType::TQ1_0 => 34,
+            GgmlType::TQ2_0 => 35,
+            GgmlType::Unknown(v) => *v,
         }
     }
 
@@ -1221,16 +1690,36 @@ impl<'a> super::loader::Reader for GgufReader<'a> {
         // Handle quantized types by dequantizing to F16
         if info.tensor_type.is_quantized() {
             let data = self.get_tensor_data(info);
-            let dequantized = match info.tensor_type {
+
+            // For K-quants, calculate actual elements from raw data size
+            let actual_elements = match info.tensor_type {
+                GgmlType::Q4K => (data.len() / 144) * 256,
+                GgmlType::Q5K => (data.len() / 176) * 256,
+                GgmlType::Q6K => (data.len() / 210) * 256,
+                GgmlType::Q3K => (data.len() / 110) * 256,
+                GgmlType::Q2K => (data.len() / 84) * 256,
+                _ => num_elements,
+            };
+
+            let mut dequantized = match info.tensor_type {
                 GgmlType::Q8_0 => dequantize_q8_0_to_f16(data, num_elements),
                 GgmlType::Q4_0 => dequantize_q4_0_to_f16(data, num_elements),
-                GgmlType::Q4K => dequantize_q4_k_to_f16(data, num_elements),
-                GgmlType::Q5K => dequantize_q5_k_to_f16(data, num_elements),
-                GgmlType::Q6K => dequantize_q6_k_to_f16(data, num_elements),
-                GgmlType::Q3K => dequantize_q3_k_to_f16(data, num_elements),
-                GgmlType::Q2K => dequantize_q2_k_to_f16(data, num_elements),
+                GgmlType::Q4K => dequantize_q4_k_to_f16(data, actual_elements),
+                GgmlType::Q5K => dequantize_q5_k_to_f16(data, actual_elements),
+                GgmlType::Q6K => dequantize_q6_k_to_f16(data, actual_elements),
+                GgmlType::Q3K => dequantize_q3_k_to_f16(data, actual_elements),
+                GgmlType::Q2K => dequantize_q2_k_to_f16(data, actual_elements),
                 _ => return Err(GgufError::UnsupportedTensorType(info.tensor_type).into()),
             };
+
+            // Ensure output matches expected size (handle K-quant padding)
+            let expected_bytes = num_elements * 2; // f16 = 2 bytes
+            if dequantized.len() > expected_bytes {
+                dequantized.truncate(expected_bytes);
+            } else if dequantized.len() < expected_bytes {
+                // Pad with zeros if needed
+                dequantized.resize(expected_bytes, 0);
+            }
 
             // Reverse 2D+ tensor shapes to match SafeTensors convention
             if shape.len() > 1 {
@@ -1275,6 +1764,26 @@ impl<'a> super::loader::Reader for GgufReader<'a> {
         let data = self.get_tensor_data(info);
 
         Ok((dtype, shape, Cow::Borrowed(data)))
+    }
+
+    fn quantized_tensor(&self, name: &str) -> Option<(u32, &[u8])> {
+        // Don't support direct loading for virtual/sliced tensors
+        if self.try_get_fused_slice(name).is_some() {
+            return None;
+        }
+
+        let gguf_name = self.resolve_name(name)?;
+        let info = self.tensors.get(gguf_name)?;
+
+        // Only return data for quantized types that support direct loading
+        // K-quants disabled for now due to padding issues
+        match info.tensor_type {
+            GgmlType::Q8_0 | GgmlType::Q4_0 => {
+                let data = self.get_tensor_data(info);
+                Some((info.tensor_type.to_u32(), data))
+            }
+            _ => None,
+        }
     }
 }
 
