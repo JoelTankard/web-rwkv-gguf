@@ -80,13 +80,17 @@ Peak VRAM: Quantized only
 
 ### Phase 7: Native Quantized Matmul Shaders (Baseline) ✅
 
-**Goal:** Implement true quantized matrix multiplication that operates directly on packed 4-bit data without full dequantization.
+**Goal:** Implement true quantized matrix multiplication that operates directly on packed 4-bit data without full dequantization, achieving actual compute speedup (not just memory savings).
 
-**Approach:** Extend existing web-rwkv WebGPU/WGSL infrastructure:
+**Current Problem:** GGUF Q4_K tensors are dequantized to F16 at load time, so inference runs at F16 speed despite smaller file/RAM footprint.
 
--   Add `Matrix::Q4K`, `Matrix::Q5K`, `Matrix::Q6K`, `Matrix::Q8_0` variants
--   Create `matmul_vec_*.wgsl` and `matmul_mat_*.wgsl` shaders with inline dequantization
+**Approach:** Extend existing web-rwkv WebGPU/WGSL infrastructure (NOT a new engine):
+
+-   Add `Matrix::Q4K`, `Matrix::Q5K`, `Matrix::Q6K`, `Matrix::Q8_0` variants alongside existing `Fp16`, `Int8`, `Fp4`
+-   Create `matmul_vec_*.wgsl` and `matmul_mat_*.wgsl` shaders with inline dequantization following patterns in `src/shaders/`
 -   Integrate via `TensorOp::matmul_*` like existing quantized matmul ops
+
+**Reference (for dequant math only):** llama.cpp Vulkan shaders, MLC-LLM/WebLLM
 
 **Implementation Steps:**
 
@@ -96,9 +100,27 @@ Peak VRAM: Quantized only
 -   [x] Update loader to create native Matrix variants from GGUF data
 -   [x] Benchmark against F16 path
 
-**Results:** Native Q4K shaders are **slower** than F16 dequant path (~50% slower prefill, ~37% slower generation). Currently disabled in favor of F16 dequantization.
+**Results (M2 Max, 0.1B model):**
+
+| Format      | File Size | Load Time | RAM Δ    | Prefill  | Generation |
+| ----------- | --------- | --------- | -------- | -------- | ---------- |
+| SafeTensors | 364.5 MB  | 1219 ms   | 889.0 MB | 2723 t/s | 168.7 t/s  |
+| GGUF Q4_K   | 126.4 MB  | 776 ms    | 201.4 MB | 2829 t/s | 169.5 t/s  |
+
+**Key findings:**
+
+-   **65% smaller** file size
+-   **36% faster** load time (no dequant→requant repacking)
+-   **77% less RAM** during loading
+-   **+4% prefill, +0.5% generation** - baseline implementation, not yet optimized
 
 **Root Cause:** Per-element dequantization during matmul adds significant overhead. The F16 path dequantizes once at load time and uses highly optimized F16 matmul shaders.
+
+**Next steps for optimization:**
+
+-   [ ] Optimize shader with vectorized dequantization
+-   [ ] Add shared memory tiling for better memory access patterns
+-   [ ] Extend to Q5_K, Q6_K, Q8_0 formats
 
 ### Phase 8: TVM/MLC-LLM Integration (Planned)
 
