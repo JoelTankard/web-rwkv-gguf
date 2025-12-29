@@ -145,13 +145,15 @@ _Note: Actual RWKV GGUF naming may vary - will verify with real files._
     -   1D tensors: convert to `[x, 1]` for proper `from_slice_rev` handling
     -   `r_k` tensor: reshape from 1D `[768]` to 2D `[num_head, head_dim]` by inferring from `a1` tensor
 -   F32/BF16 → F16 conversion during tensor loading
+-   Q8_0/Q4_0 → F16 dequantization during tensor loading (supports pre-quantized GGUF models)
 -   Chat example updated with streaming output and tokens/second display
+-   Benchmark example (`bench_format`) for comparing .st vs .gguf performance
 -   All tests passing, model produces coherent output
 
 **Pending (for full memory benefit):**
 
--   Direct loading of pre-quantized GGUF tensors (Q4_K, Q8_0)
--   Currently loads F16 GGUF files through existing F16→quantize path
+-   Direct GPU loading of pre-quantized GGUF tensors to web-rwkv's Int8/Fp4 format
+-   Currently Q8_0/Q4_0 tensors are dequantized to F16, then re-quantized on GPU
 
 ## Success Criteria
 
@@ -159,8 +161,8 @@ _Note: Actual RWKV GGUF naming may vary - will verify with real files._
 -   [x] Load RWKV F16 GGUF models
 -   [x] Inference produces coherent output matching SafeTensors quality
 -   [x] No performance regression (~140 tok/s on M2 Max)
--   [ ] Load RWKV pre-quantized GGUF models without FP16 staging
--   [ ] Peak VRAM reduced by ~50% for Q4 models
+-   [x] Load RWKV pre-quantized GGUF models (Q8_0, Q4_0) via dequantization
+-   [ ] Direct quantized loading to bypass F16 staging (future optimization)
 
 ## Usage
 

@@ -1,9 +1,78 @@
 use std::{borrow::Cow, collections::HashMap};
 
+use half::f16;
 use safetensors::{Dtype, SafeTensorError};
 use thiserror::Error;
 
 use super::loader::ReaderTensor;
+
+/// Dequantize GGUF Q8_0 data to F16.
+/// Q8_0 format: blocks of 32 elements, each block is [scale: f16, data: i8[32]] = 34 bytes
+fn dequantize_q8_0_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 34; // 2 bytes scale + 32 bytes data
+
+    let num_blocks = num_elements / BLOCK_SIZE;
+    let mut output = Vec::with_capacity(num_elements * 2); // f16 = 2 bytes
+
+    for block_idx in 0..num_blocks {
+        let block_start = block_idx * BLOCK_BYTES;
+        let block_data = &data[block_start..block_start + BLOCK_BYTES];
+
+        // First 2 bytes are the scale (f16)
+        let scale_bytes = [block_data[0], block_data[1]];
+        let scale = f16::from_le_bytes(scale_bytes);
+        let scale_f32 = scale.to_f32();
+
+        // Next 32 bytes are the quantized values (i8)
+        for i in 0..BLOCK_SIZE {
+            let quant_val = block_data[2 + i] as i8;
+            let dequant_val = (quant_val as f32) * scale_f32;
+            let f16_val = f16::from_f32(dequant_val);
+            output.extend_from_slice(&f16_val.to_le_bytes());
+        }
+    }
+
+    output
+}
+
+/// Dequantize GGUF Q4_0 data to F16.
+/// Q4_0 format: blocks of 32 elements, each block is [scale: f16, data: u8[16]] = 18 bytes
+/// Each byte contains 2 4-bit values
+fn dequantize_q4_0_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 18; // 2 bytes scale + 16 bytes data (32 4-bit values)
+
+    let num_blocks = num_elements / BLOCK_SIZE;
+    let mut output = Vec::with_capacity(num_elements * 2); // f16 = 2 bytes
+
+    for block_idx in 0..num_blocks {
+        let block_start = block_idx * BLOCK_BYTES;
+        let block_data = &data[block_start..block_start + BLOCK_BYTES];
+
+        // First 2 bytes are the scale (f16)
+        let scale_bytes = [block_data[0], block_data[1]];
+        let scale = f16::from_le_bytes(scale_bytes);
+        let scale_f32 = scale.to_f32();
+
+        // Next 16 bytes contain 32 4-bit values (2 per byte)
+        // Q4_0 stores values as unsigned 0-15, subtract 8 to get signed -8 to 7
+        for i in 0..16 {
+            let byte = block_data[2 + i];
+            // Low nibble first, then high nibble
+            let lo = (byte & 0x0F) as i8 - 8;
+            let hi = ((byte >> 4) & 0x0F) as i8 - 8;
+
+            let dequant_lo = (lo as f32) * scale_f32;
+            let dequant_hi = (hi as f32) * scale_f32;
+
+            output.extend_from_slice(&f16::from_f32(dequant_lo).to_le_bytes());
+            output.extend_from_slice(&f16::from_f32(dequant_hi).to_le_bytes());
+        }
+    }
+
+    output
+}
 
 pub const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
 pub const GGUF_VERSION: u32 = 3;
@@ -125,6 +194,24 @@ impl GgmlType {
             GgmlType::F64 => Some(Dtype::F64),
             _ => None, // Quantized types don't map directly to Dtype
         }
+    }
+
+    pub fn is_quantized(&self) -> bool {
+        matches!(
+            self,
+            GgmlType::Q4_0
+                | GgmlType::Q4_1
+                | GgmlType::Q5_0
+                | GgmlType::Q5_1
+                | GgmlType::Q8_0
+                | GgmlType::Q8_1
+                | GgmlType::Q2K
+                | GgmlType::Q3K
+                | GgmlType::Q4K
+                | GgmlType::Q5K
+                | GgmlType::Q6K
+                | GgmlType::Q8K
+        )
     }
 
     pub fn type_size(&self) -> usize {
@@ -780,12 +867,32 @@ impl<'a> super::loader::Reader for GgufReader<'a> {
             .get(gguf_name)
             .ok_or_else(|| GgufError::TensorNotFound(name.to_string()))?;
 
+        let num_elements = info.num_elements() as usize;
+        let mut shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+
+        // Handle quantized types by dequantizing to F16
+        if info.tensor_type.is_quantized() {
+            let data = self.get_tensor_data(info);
+            let dequantized = match info.tensor_type {
+                GgmlType::Q8_0 => dequantize_q8_0_to_f16(data, num_elements),
+                GgmlType::Q4_0 => dequantize_q4_0_to_f16(data, num_elements),
+                _ => return Err(GgufError::UnsupportedTensorType(info.tensor_type).into()),
+            };
+
+            // Reverse 2D+ tensor shapes to match SafeTensors convention
+            if shape.len() > 1 {
+                shape.reverse();
+            } else {
+                shape.push(1);
+            }
+
+            return Ok((Dtype::F16, shape, Cow::Owned(dequantized)));
+        }
+
         let dtype = info
             .tensor_type
             .to_dtype()
             .ok_or_else(|| GgufError::UnsupportedTensorType(info.tensor_type))?;
-
-        let mut shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
 
         // Handle r_k tensor: GGUF stores as 1D [768], SafeTensors as 2D [num_head, head_dim]
         if shape.len() == 1 && name.ends_with(".att.r_k") {
@@ -828,6 +935,47 @@ mod tests {
         assert_eq!(GgmlType::F16.type_size(), 2);
         assert_eq!(GgmlType::Q8_0.type_size(), 34);
         assert_eq!(GgmlType::Q4_0.type_size(), 18);
+    }
+
+    #[test]
+    fn test_dequantize_q8_0() {
+        // Create a Q8_0 block: scale=1.0, values=[0, 1, 2, ..., 31]
+        let scale = f16::from_f32(1.0);
+        let mut block = Vec::with_capacity(34);
+        block.extend_from_slice(&scale.to_le_bytes());
+        for i in 0i8..32 {
+            block.push(i as u8);
+        }
+
+        let result = dequantize_q8_0_to_f16(&block, 32);
+        assert_eq!(result.len(), 64); // 32 f16 values = 64 bytes
+
+        // Check first few values
+        let val0 = f16::from_le_bytes([result[0], result[1]]);
+        let val1 = f16::from_le_bytes([result[2], result[3]]);
+        assert!((val0.to_f32() - 0.0).abs() < 0.01);
+        assert!((val1.to_f32() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_dequantize_q4_0() {
+        // Create a Q4_0 block: scale=1.0, values stored as nibbles
+        let scale = f16::from_f32(1.0);
+        let mut block = Vec::with_capacity(18);
+        block.extend_from_slice(&scale.to_le_bytes());
+        // 16 bytes for 32 4-bit values
+        // Each byte: low nibble first, high nibble second
+        // Values 0-15 map to -8 to 7 after subtracting 8
+        for _ in 0..16 {
+            block.push(0x88); // Both nibbles = 8, which maps to 0
+        }
+
+        let result = dequantize_q4_0_to_f16(&block, 32);
+        assert_eq!(result.len(), 64); // 32 f16 values = 64 bytes
+
+        // All values should be 0 (8 - 8 = 0)
+        let val0 = f16::from_le_bytes([result[0], result[1]]);
+        assert!((val0.to_f32() - 0.0).abs() < 0.01);
     }
 
     #[test]
