@@ -1220,6 +1220,732 @@ impl TensorOp {
         })
     }
 
+    /// Q4_K matrix-vector multiplication with inline dequantization.
+    /// - `matrix` contains raw Q4_K blocks (144 bytes per 256 elements).
+    /// - `matrix_shape` is a tensor whose shape represents the logical matrix shape `[K, M, B]`.
+    /// - `input` shape: `[K, T, B]`.
+    /// - `output` shape: `[M, T, B]`.
+    ///
+    /// Notes:
+    /// 1. `K` must be multiples of 256 (Q4_K super-block size).
+    /// 2. `M` must be multiples of 4.
+    pub fn matmul_vec_q4k<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        act: Activation,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let context = matrix.context();
+        let logical_shape = matrix_shape.shape();
+        let shape = {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+            output.shape()
+        };
+
+        #[cfg(not(feature = "subgroup-ops"))]
+        let key = PipelineKey::new(
+            "matmul_vec_q4k",
+            "matmul",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+        #[cfg(feature = "subgroup-ops")]
+        let key = PipelineKey::new(
+            "matmul_vec_q4k",
+            "matmul",
+            Macros::new()
+                .subgroup(context.min_subgroup_size(), context.max_subgroup_size())
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+
+        #[cfg(not(feature = "subgroup-ops"))]
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/matmul_vec_q4k.wgsl"),
+            &[
+                matrix_shape.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+        #[cfg(feature = "subgroup-ops")]
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/subgroup/matmul_vec_q4k.wgsl"),
+            &[
+                matrix_shape.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, matrix_shape)
+            .bind_meta(1, &input)
+            .bind_meta(2, &output)
+            .bind(3, matrix)
+            .bind(4, &input)
+            .bind(5, &output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                logical_shape[1] as u32 / 4,
+                shape[1] as u32,
+                shape[2] as u32,
+            ],
+        })
+    }
+
+    /// Q4_K matrix-matrix multiplication with inline dequantization.
+    /// - `matrix` contains raw Q4_K blocks (144 bytes per 256 elements).
+    /// - `matrix_shape` is a tensor whose shape represents the logical matrix shape `[K, M, B]`.
+    /// - `input` shape: `[K, N, B]`.
+    /// - `output` shape: `[M, N, B]`.
+    ///
+    /// Notes:
+    /// 1. `K` must be multiples of 256 (Q4_K super-block size).
+    /// 2. `M` and `N` must be multiples of 4.
+    pub fn matmul_mat_q4k<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        act: Activation,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 8;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let context = matrix.context();
+        let shape = {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+            output.shape()
+        };
+
+        let key = PipelineKey::new(
+            "matmul_mat_q4k",
+            "matmul",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/matmul_mat_q4k.wgsl"),
+            &[
+                matrix_shape.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, matrix_shape)
+            .bind_meta(1, &input)
+            .bind_meta(2, &output)
+            .bind(3, matrix)
+            .bind(4, &input)
+            .bind(5, &output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                u32::div_ceil(u32::div_ceil(shape[0] as u32, 4), BLOCK_SIZE),
+                u32::div_ceil(u32::div_ceil(shape[1] as u32, 4), BLOCK_SIZE),
+                shape[2] as u32,
+            ],
+        })
+    }
+
+    /// Optimized Q4_K matrix-vector multiplication with shared memory input caching.
+    /// Each workgroup processes BLOCK_SIZE output rows while sharing cached input.
+    /// This reduces memory bandwidth by reading Q4K weights (144 bytes/256 elements)
+    /// instead of F16 (512 bytes/256 elements) = 3.5x less weight bandwidth.
+    /// - `matrix` contains raw Q4_K blocks (144 bytes per 256 elements).
+    /// - `matrix_shape` is a tensor whose shape represents the logical matrix shape `[K, M, B]`.
+    /// - `input` shape: `[K, T, B]`.
+    /// - `output` shape: `[M, T, B]`.
+    pub fn matmul_vec_q4k_opt<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        act: Activation,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let context = matrix.context();
+        let logical_shape = matrix_shape.shape();
+        let shape = {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+            output.shape()
+        };
+
+        let key = PipelineKey::new(
+            "matmul_vec_q4k_v2",
+            "matmul",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/matmul_vec_q4k_v2.wgsl"),
+            &[
+                matrix_shape.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, matrix_shape)
+            .bind_meta(1, &input)
+            .bind_meta(2, &output)
+            .bind(3, matrix)
+            .bind(4, &input)
+            .bind(5, &output)
+            .build()];
+
+        // Dispatch: one thread per output vec4 (4 elements)
+        // M/4 output vec4s, divided into workgroups of BLOCK_SIZE
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                u32::div_ceil(logical_shape[1] as u32 / 4, BLOCK_SIZE),
+                shape[1] as u32,
+                shape[2] as u32,
+            ],
+        })
+    }
+
+    /// Optimized Q4_K matrix-matrix multiplication with tiled computation.
+    /// Uses shared memory for both input and dequantized weight tiles.
+    /// - `matrix` contains raw Q4_K blocks (144 bytes per 256 elements).
+    /// - `matrix_shape` is a tensor whose shape represents the logical matrix shape `[K, M, B]`.
+    /// - `input` shape: `[K, N, B]`.
+    /// - `output` shape: `[M, N, B]`.
+    pub fn matmul_mat_q4k_opt<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        act: Activation,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 8;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let context = matrix.context();
+        let shape = {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+            output.shape()
+        };
+
+        let key = PipelineKey::new(
+            "matmul_mat_q4k_opt",
+            "matmul",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/matmul_mat_q4k_opt.wgsl"),
+            &[
+                matrix_shape.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, matrix_shape)
+            .bind_meta(1, &input)
+            .bind_meta(2, &output)
+            .bind(3, matrix)
+            .bind(4, &input)
+            .bind(5, &output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                u32::div_ceil(u32::div_ceil(shape[0] as u32, 4), BLOCK_SIZE),
+                u32::div_ceil(u32::div_ceil(shape[1] as u32, 4), BLOCK_SIZE),
+                shape[2] as u32,
+            ],
+        })
+    }
+
+    /// Q5_K matrix-vector multiplication with inline dequantization.
+    /// - `matrix` contains raw Q5_K blocks (176 bytes per 256 elements).
+    /// - `matrix_shape` is a tensor whose shape represents the logical matrix shape `[K, M, B]`.
+    /// - `input` shape: `[K, T, B]`.
+    /// - `output` shape: `[M, T, B]`.
+    pub fn matmul_vec_q5k<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        act: Activation,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let context = matrix.context();
+        let logical_shape = matrix_shape.shape();
+        let shape = {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+            output.shape()
+        };
+
+        let key = PipelineKey::new(
+            "matmul_vec_q5k",
+            "matmul",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/matmul_vec_q5k.wgsl"),
+            &[
+                matrix_shape.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, matrix_shape)
+            .bind_meta(1, &input)
+            .bind_meta(2, &output)
+            .bind(3, matrix)
+            .bind(4, &input)
+            .bind(5, &output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                logical_shape[1] as u32 / 4,
+                shape[1] as u32,
+                shape[2] as u32,
+            ],
+        })
+    }
+
+    /// Q5_K matrix-matrix multiplication with inline dequantization.
+    /// - `matrix` contains raw Q5_K blocks (176 bytes per 256 elements).
+    /// - `matrix_shape` is a tensor whose shape represents the logical matrix shape `[K, M, B]`.
+    /// - `input` shape: `[K, N, B]`.
+    /// - `output` shape: `[M, N, B]`.
+    pub fn matmul_mat_q5k<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        act: Activation,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 8;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let context = matrix.context();
+        let shape = {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+            output.shape()
+        };
+
+        let key = PipelineKey::new(
+            "matmul_mat_q5k",
+            "matmul",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/matmul_mat_q5k.wgsl"),
+            &[
+                matrix_shape.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, matrix_shape)
+            .bind_meta(1, &input)
+            .bind_meta(2, &output)
+            .bind(3, matrix)
+            .bind(4, &input)
+            .bind(5, &output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                u32::div_ceil(u32::div_ceil(shape[0] as u32, 4), BLOCK_SIZE),
+                u32::div_ceil(u32::div_ceil(shape[1] as u32, 4), BLOCK_SIZE),
+                shape[2] as u32,
+            ],
+        })
+    }
+
+    /// Q6_K matrix-vector multiplication with inline dequantization.
+    /// - `matrix` contains raw Q6_K blocks (210 bytes per 256 elements).
+    /// - `matrix_shape` is a tensor whose shape represents the logical matrix shape `[K, M, B]`.
+    /// - `input` shape: `[K, T, B]`.
+    /// - `output` shape: `[M, T, B]`.
+    pub fn matmul_vec_q6k<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        act: Activation,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let context = matrix.context();
+        let logical_shape = matrix_shape.shape();
+        let shape = {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+            output.shape()
+        };
+
+        let key = PipelineKey::new(
+            "matmul_vec_q6k",
+            "matmul",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/matmul_vec_q6k.wgsl"),
+            &[
+                matrix_shape.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, matrix_shape)
+            .bind_meta(1, &input)
+            .bind_meta(2, &output)
+            .bind(3, matrix)
+            .bind(4, &input)
+            .bind(5, &output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                logical_shape[1] as u32 / 4,
+                shape[1] as u32,
+                shape[2] as u32,
+            ],
+        })
+    }
+
+    /// Q6_K matrix-matrix multiplication with inline dequantization.
+    /// - `matrix` contains raw Q6_K blocks (210 bytes per 256 elements).
+    /// - `matrix_shape` is a tensor whose shape represents the logical matrix shape `[K, M, B]`.
+    /// - `input` shape: `[K, N, B]`.
+    /// - `output` shape: `[M, N, B]`.
+    pub fn matmul_mat_q6k<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        act: Activation,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 8;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let context = matrix.context();
+        let shape = {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+            output.shape()
+        };
+
+        let key = PipelineKey::new(
+            "matmul_mat_q6k",
+            "matmul",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/matmul_mat_q6k.wgsl"),
+            &[
+                matrix_shape.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, matrix_shape)
+            .bind_meta(1, &input)
+            .bind_meta(2, &output)
+            .bind(3, matrix)
+            .bind(4, &input)
+            .bind(5, &output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                u32::div_ceil(u32::div_ceil(shape[0] as u32, 4), BLOCK_SIZE),
+                u32::div_ceil(u32::div_ceil(shape[1] as u32, 4), BLOCK_SIZE),
+                shape[2] as u32,
+            ],
+        })
+    }
+
+    /// Q8_0 matrix-vector multiplication with inline dequantization.
+    /// - `matrix` contains raw Q8_0 blocks (34 bytes per 32 elements).
+    /// - `matrix_shape` is a tensor whose shape represents the logical matrix shape `[K, M, B]`.
+    /// - `input` shape: `[K, T, B]`.
+    /// - `output` shape: `[M, T, B]`.
+    pub fn matmul_vec_q8_0<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        act: Activation,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let context = matrix.context();
+        let logical_shape = matrix_shape.shape();
+        let shape = {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+            output.shape()
+        };
+
+        let key = PipelineKey::new(
+            "matmul_vec_q8_0",
+            "matmul",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/matmul_vec_q8_0.wgsl"),
+            &[
+                matrix_shape.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, matrix_shape)
+            .bind_meta(1, &input)
+            .bind_meta(2, &output)
+            .bind(3, matrix)
+            .bind(4, &input)
+            .bind(5, &output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                logical_shape[1] as u32 / 4,
+                shape[1] as u32,
+                shape[2] as u32,
+            ],
+        })
+    }
+
+    /// Q8_0 matrix-matrix multiplication with inline dequantization.
+    /// - `matrix` contains raw Q8_0 blocks (34 bytes per 32 elements).
+    /// - `matrix_shape` is a tensor whose shape represents the logical matrix shape `[K, M, B]`.
+    /// - `input` shape: `[K, N, B]`.
+    /// - `output` shape: `[M, N, B]`.
+    pub fn matmul_mat_q8_0<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        act: Activation,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 8;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let context = matrix.context();
+        let shape = {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+            output.shape()
+        };
+
+        let key = PipelineKey::new(
+            "matmul_mat_q8_0",
+            "matmul",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/matmul_mat_q8_0.wgsl"),
+            &[
+                matrix_shape.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, matrix_shape)
+            .bind_meta(1, &input)
+            .bind_meta(2, &output)
+            .bind(3, matrix)
+            .bind(4, &input)
+            .bind(5, &output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                u32::div_ceil(u32::div_ceil(shape[0] as u32, 4), BLOCK_SIZE),
+                u32::div_ceil(u32::div_ceil(shape[1] as u32, 4), BLOCK_SIZE),
+                shape[2] as u32,
+            ],
+        })
+    }
+
     /// Add `input` to `output`.
     /// - `input` shape: `[C, 1, B]` or `[C, T, B]`.
     /// - `output` shape: `[C, T, B]`.

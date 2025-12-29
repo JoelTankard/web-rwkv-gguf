@@ -10,21 +10,26 @@ This fork adds the ability to load RWKV models in [GGUF format](https://github.c
 
 -   **GGUF file format parsing** — Full parser for GGUF v3 headers, metadata, and tensor info
 -   **RWKV tensor name mapping** — Automatic translation between GGUF and SafeTensors naming conventions
--   **Multiple data types** — Supports F16, BF16, F32, Q8_0, and Q4_0 GGUF tensors
+-   **Multiple data types** — Supports F16, BF16, F32, and quantized GGUF tensors
 -   **RWKV V7 support** — Handles V7-specific tensors including fused `time_mix_lerp_fused` → individual `x_r`, `x_w`, `x_k`, `x_v`, `x_a`, `x_g` slicing
 -   **Drop-in replacement** — Use `.gguf` files anywhere you'd use `.st` files
 
-### Current Status
+### Supported Quantizations
 
-| Feature                      | Status                           |
-| ---------------------------- | -------------------------------- |
-| GGUF parsing                 | ✅ Complete                      |
-| F16/BF16/F32 loading         | ✅ Complete                      |
-| Q8_0/Q4_0 dequantization     | ✅ Complete (dequantizes to F16) |
-| RWKV V4-V7 compatibility     | ✅ Tested                        |
-| Direct quantized GPU loading | 🔜 Planned                       |
+| GGUF Type | Status     | Notes                           |
+| --------- | ---------- | ------------------------------- |
+| F16       | ✅ Native  | Direct loading                  |
+| BF16      | ✅ Native  | Converts to F16                 |
+| F32       | ✅ Native  | Converts to F16                 |
+| Q4_K      | ✅ Native  | Inline dequantization in shader |
+| Q5_K      | ❔ Native  | Inline dequantization in shader |
+| Q6_K      | ❔ Native  | Inline dequantization in shader |
+| Q8_0      | ❔ Native  | Inline dequantization in shader |
+| Q2_K      | ❔ Dequant | Dequantizes to F16 at load time |
+| Q3_K      | ❔ Dequant | Dequantizes to F16 at load time |
+| Q4_0      | ❔ Dequant | Dequantizes to F16 at load time |
 
-> **Note:** Pre-quantized GGUF tensors (Q8_0, Q4_0) are currently dequantized to F16 during loading, then optionally re-quantized on GPU. Direct loading to web-rwkv's Int8/Fp4 format is planned to reduce peak VRAM usage.
+> **Recommended:** Q4_K_M or Q5_K_M for best balance of quality and VRAM usage.
 
 ## Quick Start
 
@@ -36,15 +41,36 @@ cargo run --release --example chat -- --model /path/to/model.gguf
 cargo run --release --example chat -- --model /path/to/model.st
 ```
 
-## Converting Models to GGUF
+## Converting Models
 
-Use the included conversion script:
+### `.pth` to Q4_K_M GGUF (Recommended)
+
+To get a Q4_K_M quantized GGUF from a PyTorch `.pth` file:
 
 ```bash
-python assets/scripts/convert_hf_to_gguf.py /path/to/model.pth /path/to/rwkv_vocab.txt --outtype f16
+# 1. Install dependencies
+pip install torch numpy gguf
+
+# 2. Convert .pth to F16 GGUF
+python assets/scripts/convert_hf_to_gguf.py /path/to/model.pth assets/models/rwkv_vocab_v20230424.json --outtype f16
+
+# 3. Quantize to Q4_K_M using llama.cpp's llama-quantize
+llama-quantize /path/to/model-F16.gguf /path/to/model-Q4_K_M.gguf Q4_K_M
 ```
 
-Supported output types: `f16`, `bf16`, `f32`, `q8_0`
+Supported `--outtype` values: `f16`, `bf16`, `f32`, `q8_0`, `auto`
+
+### `.pth` to SafeTensors (for bench_format testing)
+
+To convert a `.pth` file to SafeTensors format for benchmarking:
+
+```bash
+# Convert .pth to .st
+python assets/scripts/convert_safetensors.py --input /path/to/model.pth --output /path/to/model.st
+
+# Run bench_format to compare performance
+cargo run --release --example bench_format -- --model /path/to/model.st
+```
 
 ## Upstream Project
 
