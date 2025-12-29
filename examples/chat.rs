@@ -392,6 +392,7 @@ async fn main() -> Result<()> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
 
+        // inference loop: read the user prompt and generate until the stop token "\n\n"
         loop {
             let input = inference.clone();
             let (input, output) = runtime.infer(input).await?;
