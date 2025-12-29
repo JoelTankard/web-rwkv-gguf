@@ -43,26 +43,39 @@ Peak VRAM: Quantized only
 -   [x] Map GGUF tensor names to SafeTensors-style names (RWKV naming convention)
 -   [x] Handle tensor data access via mmap offsets
 
-### Phase 3: Quantization Type Mapping (Future)
+### Phase 3: Basic Quantization Support ✅
 
--   [ ] Map GGUF types to web-rwkv Matrix variants:
-    -   `GGML_TYPE_F16` → Load as FP16, use existing path ✅
-    -   `GGML_TYPE_Q8_0` → Direct load to `Matrix::Int8`
-    -   `GGML_TYPE_Q4_0/Q4_K` → Direct load to `Matrix::Fp4`
--   [ ] Implement dequantization for unsupported types (fallback to FP16)
+-   [x] F16/BF16/F32 native loading
+-   [x] Q8_0 dequantization to F16 (CPU-side)
+-   [x] Q4_0 dequantization to F16 (CPU-side)
+-   [x] Benchmark example comparing .st vs .gguf
 
-### Phase 4: Direct Quantized Loading (Future)
+### Phase 4: K-Quant Support ✅
 
--   [ ] Add `load_matrix_quantized` methods to `Loader`
--   [ ] Bypass FP16 staging for compatible quantization types
--   [ ] Handle block size and absmax differences between GGUF and web-rwkv formats
+-   [x] Implement Q4_K dequantization (super-blocks with nested quantization)
+-   [x] Implement Q5_K dequantization
+-   [x] Implement Q6_K dequantization
+-   [x] Implement Q3_K dequantization
+-   [x] Implement Q2_K dequantization
+-   [ ] Update conversion script to support K-quants
 
-### Phase 5: Integration & Testing
+### Phase 5: Direct GPU Quantized Loading (Future Optimization)
+
+-   [ ] Analyze block size differences:
+    -   GGUF Q8_0: 32 elements/block (34 bytes: 2B scale + 32B data)
+    -   web-rwkv Int8: 128 elements/block (different scale layout)
+-   [ ] Option A: Repack GGUF Q8_0 → web-rwkv Int8 on CPU (still saves F16 staging)
+-   [ ] Option B: New GPU shader for GGUF Q8_0 block format
+-   [ ] Option C: Modify web-rwkv quantization to match GGUF block sizes
+-   [ ] Add `load_matrix_quantized_direct` methods to `Loader`
+-   [ ] Bypass F16 staging entirely for compatible types
+
+### Phase 6: Integration & Testing ✅
 
 -   [x] Add GGUF detection in examples (chat)
--   [ ] Test with RWKV GGUF models from HuggingFace
--   [ ] Benchmark memory usage vs SafeTensors path
--   [ ] Document GGUF usage in README
+-   [x] Test with RWKV GGUF models (Q8_0 tested, working)
+-   [x] Benchmark memory usage vs SafeTensors path
+-   [x] Document GGUF usage in README
 
 ## GGUF File Structure Reference
 
@@ -86,15 +99,25 @@ Peak VRAM: Quantized only
 └─────────────────────────────────────┘
 ```
 
-## GGUF Quantization Types (Relevant)
+## GGUF Quantization Types
 
-| GGUF Type | Value | Description    | web-rwkv Mapping       |
-| --------- | ----- | -------------- | ---------------------- |
-| F32       | 0     | 32-bit float   | Convert to F16         |
-| F16       | 1     | 16-bit float   | Matrix::Fp16           |
-| Q4_0      | 2     | 4-bit (simple) | Matrix::Fp4 (convert)  |
-| Q8_0      | 8     | 8-bit (simple) | Matrix::Int8 (convert) |
-| BF16      | 30    | bfloat16       | Convert to F16         |
+| GGUF Type | Value | Block Size | Description    | Status             |
+| --------- | ----- | ---------- | -------------- | ------------------ |
+| F32       | 0     | 1          | 32-bit float   | ✅ Supported       |
+| F16       | 1     | 1          | 16-bit float   | ✅ Supported       |
+| Q4_0      | 2     | 32         | 4-bit (simple) | ✅ Dequant to F16  |
+| Q4_1      | 3     | 32         | 4-bit + min    | ❌ Not implemented |
+| Q5_0      | 6     | 32         | 5-bit (simple) | ❌ Not implemented |
+| Q5_1      | 7     | 32         | 5-bit + min    | ❌ Not implemented |
+| Q8_0      | 8     | 32         | 8-bit (simple) | ✅ Dequant to F16  |
+| Q8_1      | 9     | 32         | 8-bit + min    | ❌ Not implemented |
+| Q2_K      | 10    | 256        | 2-bit K-quant  | ✅ Dequant to F16  |
+| Q3_K      | 11    | 256        | 3-bit K-quant  | ✅ Dequant to F16  |
+| Q4_K      | 12    | 256        | 4-bit K-quant  | ✅ Dequant to F16  |
+| Q5_K      | 13    | 256        | 5-bit K-quant  | ✅ Dequant to F16  |
+| Q6_K      | 14    | 256        | 6-bit K-quant  | ✅ Dequant to F16  |
+| Q8_K      | 15    | 256        | 8-bit K-quant  | ❌ Not implemented |
+| BF16      | 30    | 1          | bfloat16       | ✅ Supported       |
 
 ## RWKV Tensor Name Mapping
 
@@ -146,14 +169,28 @@ _Note: Actual RWKV GGUF naming may vary - will verify with real files._
     -   `r_k` tensor: reshape from 1D `[768]` to 2D `[num_head, head_dim]` by inferring from `a1` tensor
 -   F32/BF16 → F16 conversion during tensor loading
 -   Q8_0/Q4_0 → F16 dequantization during tensor loading (supports pre-quantized GGUF models)
+-   K-quant dequantization (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K) → F16 for better compression ratios
 -   Chat example updated with streaming output and tokens/second display
 -   Benchmark example (`bench_format`) for comparing .st vs .gguf performance
 -   All tests passing, model produces coherent output
 
-**Pending (for full memory benefit):**
+**Pending:**
 
--   Direct GPU loading of pre-quantized GGUF tensors to web-rwkv's Int8/Fp4 format
--   Currently Q8_0/Q4_0 tensors are dequantized to F16, then re-quantized on GPU
+-   Direct GPU loading to bypass F16 staging (future optimization)
+
+## Benchmark Results (M2 Max, 0.1B model)
+
+| Format      | File Size | Load Time | RAM Δ    | Prefill  | Generation |
+| ----------- | --------- | --------- | -------- | -------- | ---------- |
+| SafeTensors | 364.5 MB  | 1896 ms   | 865.9 MB | 2971 t/s | 188.7 t/s  |
+| GGUF Q8_0   | 198.8 MB  | 2043 ms   | 221.1 MB | 2984 t/s | 189.1 t/s  |
+
+**Key findings:**
+
+-   **45.5% smaller** file size with Q8_0
+-   **74.5% less RAM** during loading
+-   **No performance regression** (identical inference speed)
+-   Load time ~8% slower due to CPU dequantization
 
 ## Success Criteria
 
@@ -162,6 +199,7 @@ _Note: Actual RWKV GGUF naming may vary - will verify with real files._
 -   [x] Inference produces coherent output matching SafeTensors quality
 -   [x] No performance regression (~140 tok/s on M2 Max)
 -   [x] Load RWKV pre-quantized GGUF models (Q8_0, Q4_0) via dequantization
+-   [x] K-quant support (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)
 -   [ ] Direct quantized loading to bypass F16 staging (future optimization)
 
 ## Usage
