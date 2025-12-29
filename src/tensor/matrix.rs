@@ -101,6 +101,33 @@ pub enum Matrix {
         /// This is a dummy tensor used only for its shape metadata buffer.
         s: TensorGpu<u8, ReadWrite>,
     },
+    /// Q5_K quantized matrix - stores raw GGUF Q5_K blocks for native quantized matmul.
+    /// Each super-block is 176 bytes encoding 256 elements (5.5 bits/element).
+    /// Layout: [d: f16, dmin: f16, scales: 12B, qh: 32B, qs: 128B]
+    Q5K {
+        /// Raw Q5_K block data
+        w: TensorGpu<u8, ReadWrite>,
+        /// Metadata tensor for the logical matrix shape [K, M, B]
+        s: TensorGpu<u8, ReadWrite>,
+    },
+    /// Q6_K quantized matrix - stores raw GGUF Q6_K blocks for native quantized matmul.
+    /// Each super-block is 210 bytes encoding 256 elements (6.5625 bits/element).
+    /// Layout: [ql: 128B, qh: 64B, scales: 16B, d: f16]
+    Q6K {
+        /// Raw Q6_K block data
+        w: TensorGpu<u8, ReadWrite>,
+        /// Metadata tensor for the logical matrix shape [K, M, B]
+        s: TensorGpu<u8, ReadWrite>,
+    },
+    /// Q8_0 quantized matrix - stores raw GGUF Q8_0 blocks for native quantized matmul.
+    /// Each block is 34 bytes encoding 32 elements (8.5 bits/element).
+    /// Layout: [scale: f16, data: i8[32]]
+    Q8_0 {
+        /// Raw Q8_0 block data
+        w: TensorGpu<u8, ReadWrite>,
+        /// Metadata tensor for the logical matrix shape [K, M, B]
+        s: TensorGpu<u8, ReadWrite>,
+    },
 }
 
 impl Matrix {
@@ -115,6 +142,9 @@ impl Matrix {
             Matrix::Int8 { w, m } => TensorOp::matmul_vec_int8(w, m, input, output, act, false),
             Matrix::Fp4 { w, q, m } => TensorOp::matmul_vec_nf4(w, q, m, input, output, act, false),
             Matrix::Q4K { w, s } => TensorOp::matmul_vec_q4k(w, s, input, output, act),
+            Matrix::Q5K { w, s } => TensorOp::matmul_vec_q5k(w, s, input, output, act),
+            Matrix::Q6K { w, s } => TensorOp::matmul_vec_q6k(w, s, input, output, act),
+            Matrix::Q8_0 { w, s } => TensorOp::matmul_vec_q8_0(w, s, input, output, act),
         }
     }
 
@@ -129,6 +159,9 @@ impl Matrix {
             Matrix::Int8 { w, m } => TensorOp::matmul_vec_int8(w, m, input, output, act, true),
             Matrix::Fp4 { w, q, m } => TensorOp::matmul_vec_nf4(w, q, m, input, output, act, true),
             Matrix::Q4K { w, s } => TensorOp::matmul_vec_q4k(w, s, input, output, act),
+            Matrix::Q5K { w, s } => TensorOp::matmul_vec_q5k(w, s, input, output, act),
+            Matrix::Q6K { w, s } => TensorOp::matmul_vec_q6k(w, s, input, output, act),
+            Matrix::Q8_0 { w, s } => TensorOp::matmul_vec_q8_0(w, s, input, output, act),
         }
     }
 
@@ -143,6 +176,9 @@ impl Matrix {
             Matrix::Int8 { w, m } => TensorOp::matmul_mat_int8(w, m, input, output, act),
             Matrix::Fp4 { w, q, m } => TensorOp::matmul_mat_nf4(w, q, m, input, output, act),
             Matrix::Q4K { w, s } => TensorOp::matmul_mat_q4k(w, s, input, output, act),
+            Matrix::Q5K { w, s } => TensorOp::matmul_mat_q5k(w, s, input, output, act),
+            Matrix::Q6K { w, s } => TensorOp::matmul_mat_q6k(w, s, input, output, act),
+            Matrix::Q8_0 { w, s } => TensorOp::matmul_mat_q8_0(w, s, input, output, act),
         }
     }
 

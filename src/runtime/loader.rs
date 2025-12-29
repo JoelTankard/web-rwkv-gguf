@@ -798,10 +798,7 @@ impl<R: Reader> Loader<R> {
         raw_data: &[u8],
         quant: Quant,
     ) -> Result<Option<Matrix>, LoaderError> {
-        use super::gguf::{
-            repack_q4_0_to_nf4, repack_q4_k_to_int8, repack_q5_k_to_int8, repack_q6_k_to_int8,
-            repack_q8_0_to_int8, GgmlType,
-        };
+        use super::gguf::{repack_q4_0_to_nf4, repack_q8_0_to_int8, GgmlType};
         use crate::tensor::matrix::Float4Quant;
 
         let shape = self.tensor_shape(name)?;
@@ -844,37 +841,62 @@ impl<R: Reader> Loader<R> {
                 );
                 Ok(Some(Matrix::Q4K { w, s }))
             }
-            (GgmlType::Q5K, Quant::Int8) => {
-                // Calculate actual elements from raw data size (Q5_K: 176 bytes per 256 elements)
+            (GgmlType::Q5K, Quant::Int8) | (GgmlType::Q5K, Quant::None) => {
+                // Native Q5_K loading - store raw blocks for inline dequantization during matmul
                 let actual_elements = (raw_data.len() / 176) * 256;
                 if actual_elements != num_elements || num_elements % 256 != 0 {
                     return Ok(None); // Fall back to F16 path
                 }
-                let (weights, minmax) = repack_q5_k_to_int8(raw_data, num_elements);
 
-                let w: TensorGpu<u8, ReadWrite> = TensorCpu::from_data(shape, weights)?.to(context);
-                let m_shape = Shape::new(minmax.len(), 1, 1, 1);
-                let m: TensorGpu<f16, ReadWrite> =
-                    TensorCpu::from_data(m_shape, minmax)?.to(context);
+                let block_data_shape = Shape::new(raw_data.len(), 1, 1, 1);
+                let w: TensorGpu<u8, ReadWrite> =
+                    TensorGpu::from_data_u8(context, block_data_shape, raw_data)?;
+                let s: TensorGpu<u8, ReadWrite> = context.tensor_init(shape);
 
-                log::info!("direct load (Q5_K -> Int8): {name}");
-                Ok(Some(Matrix::Int8 { w, m }))
+                log::info!(
+                    "native Q5_K load: {name} ({} elements, {} bytes)",
+                    num_elements,
+                    raw_data.len()
+                );
+                Ok(Some(Matrix::Q5K { w, s }))
             }
-            (GgmlType::Q6K, Quant::Int8) => {
-                // Calculate actual elements from raw data size (Q6_K: 210 bytes per 256 elements)
+            (GgmlType::Q6K, Quant::Int8) | (GgmlType::Q6K, Quant::None) => {
+                // Native Q6_K loading - store raw blocks for inline dequantization during matmul
                 let actual_elements = (raw_data.len() / 210) * 256;
                 if actual_elements != num_elements || num_elements % 256 != 0 {
                     return Ok(None); // Fall back to F16 path
                 }
-                let (weights, minmax) = repack_q6_k_to_int8(raw_data, num_elements);
 
-                let w: TensorGpu<u8, ReadWrite> = TensorCpu::from_data(shape, weights)?.to(context);
-                let m_shape = Shape::new(minmax.len(), 1, 1, 1);
-                let m: TensorGpu<f16, ReadWrite> =
-                    TensorCpu::from_data(m_shape, minmax)?.to(context);
+                let block_data_shape = Shape::new(raw_data.len(), 1, 1, 1);
+                let w: TensorGpu<u8, ReadWrite> =
+                    TensorGpu::from_data_u8(context, block_data_shape, raw_data)?;
+                let s: TensorGpu<u8, ReadWrite> = context.tensor_init(shape);
 
-                log::info!("direct load (Q6_K -> Int8): {name}");
-                Ok(Some(Matrix::Int8 { w, m }))
+                log::info!(
+                    "native Q6_K load: {name} ({} elements, {} bytes)",
+                    num_elements,
+                    raw_data.len()
+                );
+                Ok(Some(Matrix::Q6K { w, s }))
+            }
+            (GgmlType::Q8_0, Quant::None) => {
+                // Native Q8_0 loading - store raw blocks for inline dequantization during matmul
+                let actual_elements = (raw_data.len() / 34) * 32;
+                if actual_elements != num_elements || num_elements % 32 != 0 {
+                    return Ok(None); // Fall back to F16 path
+                }
+
+                let block_data_shape = Shape::new(raw_data.len(), 1, 1, 1);
+                let w: TensorGpu<u8, ReadWrite> =
+                    TensorGpu::from_data_u8(context, block_data_shape, raw_data)?;
+                let s: TensorGpu<u8, ReadWrite> = context.tensor_init(shape);
+
+                log::info!(
+                    "native Q8_0 load: {name} ({} elements, {} bytes)",
+                    num_elements,
+                    raw_data.len()
+                );
+                Ok(Some(Matrix::Q8_0 { w, s }))
             }
             (GgmlType::Q4_0, Quant::NF4) => {
                 // Direct Q4_0 -> NF4 repacking

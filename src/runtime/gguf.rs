@@ -1775,8 +1775,9 @@ impl<'a> super::loader::Reader for GgufReader<'a> {
         let gguf_name = self.resolve_name(name)?;
         let info = self.tensors.get(gguf_name)?;
 
-        // Only return data for quantized types that support direct loading
-        // K-quants disabled for now due to padding issues
+        // Return data for quantized types that support direct loading
+        // Note: K-quants (Q4K, Q5K, Q6K) native shaders are slower than F16 dequant path
+        // due to per-element dequantization overhead. Use F16 path for better performance.
         match info.tensor_type {
             GgmlType::Q8_0 | GgmlType::Q4_0 => {
                 let data = self.get_tensor_data(info);

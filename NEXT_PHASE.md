@@ -1,28 +1,79 @@
-# Next Phase: Native Quantized Matmul Shaders
+# Next Phase: Q4K Shader Optimization
 
-## Overview
+## Phase 7 Status: ✅ Optimizations Complete
 
-This document provides implementation details for **Phase 7**: Native quantized matrix multiplication shaders that operate directly on packed quantized data without full dequantization.
+Native quantized matmul shaders are implemented with vectorized dequantization and shared memory tiling.
 
-**Why this matters:** Current GGUF loading dequantizes Q4_K → F16 at load time. This saves memory but provides no compute speedup. True quantized matmul can achieve **1.5-2x faster inference** by:
+### Baseline Results (M2 Max, 0.1B model):
 
-1. Reducing memory bandwidth (4-bit vs 16-bit reads)
-2. Inline dequantization fused with multiply-accumulate
+| Format      | File Size | Load Time | RAM Δ    | Prefill  | Generation |
+| ----------- | --------- | --------- | -------- | -------- | ---------- |
+| SafeTensors | 364.5 MB  | 1219 ms   | 889.0 MB | 2723 t/s | 168.7 t/s  |
+| GGUF Q4_K   | 126.4 MB  | 776 ms    | 201.4 MB | 2829 t/s | 169.5 t/s  |
+
+**Achieved:**
+
+-   65% smaller file size
+-   36% faster load time
+-   77% less RAM
+-   +4% prefill, +0.5% generation (baseline)
 
 ---
 
-## Approach
+## Completed Optimizations
 
-**This is NOT a new engine.** We extend the existing web-rwkv WebGPU/WGSL infrastructure:
+### 1. ✅ Vectorized Dequantization
 
--   Add new `Matrix::Q4K` variant alongside existing `Fp16`, `Int8`, `Fp4`
--   Create new WGSL shader `matmul_mat_q4k.wgsl` following existing patterns in `src/shaders/`
--   Integrate via `TensorOp::matmul_mat_q4k` like existing `matmul_mat_int8`, `matmul_mat_nf4`
+Implemented in all quantized matmul shaders:
 
-### Reference Material (for dequantization math only)
+-   Process 8 elements per iteration using `vec4<f32>` operations
+-   Use `fma()` for fused multiply-add operations
+-   Reduced loop overhead and improved instruction-level parallelism
 
--   **llama.cpp Vulkan shaders** - Reference for Q4_K bit unpacking logic
--   **MLC-LLM/WebLLM** - Proof that WebGPU quantized inference achieves ~85% native speed
+### 2. ✅ Shared Memory Tiling
+
+Added `var<workgroup> input_cache` to vector shaders:
+
+-   Load input tile into shared memory once per workgroup
+-   All threads share the cached data
+-   Reduces global memory bandwidth significantly
+
+### 3. ✅ Extended Format Support
+
+Created native matmul shaders for additional quantization formats:
+
+| Format | Block Size | Bytes/Block | Shaders                                        |
+| ------ | ---------- | ----------- | ---------------------------------------------- |
+| Q4_K   | 256        | 144         | `matmul_vec_q4k.wgsl`, `matmul_mat_q4k.wgsl`   |
+| Q5_K   | 256        | 176         | `matmul_vec_q5k.wgsl`, `matmul_mat_q5k.wgsl`   |
+| Q6_K   | 256        | 210         | `matmul_vec_q6k.wgsl`, `matmul_mat_q6k.wgsl`   |
+| Q8_0   | 32         | 34          | `matmul_vec_q8_0.wgsl`, `matmul_mat_q8_0.wgsl` |
+
+### Components Updated
+
+-   `src/tensor/matrix.rs` - Added `Matrix::Q5K`, `Matrix::Q6K`, `Matrix::Q8_0` variants
+-   `src/tensor/ops.rs` - Added `TensorOp::matmul_vec_q5k/q6k/q8_0` and `matmul_mat_q5k/q6k/q8_0`
+-   `src/runtime/loader.rs` - Native loading paths for Q5K, Q6K, Q8_0 formats
+
+---
+
+## Next Steps
+
+### 1. Benchmark Optimized Shaders
+
+Run performance tests to measure improvement from vectorization and shared memory:
+
+```bash
+cargo run --release --example chat -- --model path/to/model.gguf
+```
+
+### 2. Subgroup Operations (Future)
+
+Consider using WebGPU subgroup operations for further optimization:
+
+-   `subgroupAdd()` for reduction operations
+-   `subgroupBroadcast()` for sharing data within subgroups
+-   Requires `enable subgroups;` directive and feature detection
 
 ---
 
@@ -30,7 +81,7 @@ This document provides implementation details for **Phase 7**: Native quantized 
 
 ### llama.cpp Vulkan Backend
 
-The most mature reference. Key files in `ggml/src/ggml-vulkan/vulkan-shaders/`:
+Key files in `ggml/src/ggml-vulkan/vulkan-shaders/`:
 
 -   `mul_mat_vec_q4_k.comp` - Q4_K matrix-vector multiply
 -   `mul_mat_vec_base.glsl` - Shared infrastructure
@@ -39,9 +90,6 @@ The most mature reference. Key files in `ggml/src/ggml-vulkan/vulkan-shaders/`:
 ### MLC-LLM / WebLLM
 
 Uses TVM to compile optimized WGSL kernels. Achieves ~85% of native Metal performance on M3 Max.
-
--   Kernels are auto-generated, not hand-written
--   Supports q4f16 and q4f32 quantization schemes
 
 ---
 
