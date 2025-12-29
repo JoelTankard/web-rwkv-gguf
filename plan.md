@@ -78,48 +78,85 @@ Peak VRAM: Quantized only
 -   [x] Benchmark memory usage vs SafeTensors path
 -   [x] Document GGUF usage in README
 
-### Phase 7: Native Quantized Matmul Shaders ✅
+### Phase 7: Native Quantized Matmul Shaders (Baseline) ✅
 
-**Goal:** Implement true quantized matrix multiplication that operates directly on packed 4-bit data without full dequantization, achieving actual compute speedup (not just memory savings).
+**Goal:** Implement true quantized matrix multiplication that operates directly on packed 4-bit data without full dequantization.
 
-**Current Problem:** GGUF Q4_K tensors are dequantized to F16 at load time, so inference runs at F16 speed despite smaller file/RAM footprint.
+**Approach:** Extend existing web-rwkv WebGPU/WGSL infrastructure:
 
-**Approach:** Extend existing web-rwkv WebGPU/WGSL infrastructure (NOT a new engine):
-
--   Add `Matrix::Q4K` variant alongside existing `Fp16`, `Int8`, `Fp4`
--   Create `matmul_mat_q4k.wgsl` following patterns in `src/shaders/`
--   Integrate via `TensorOp::matmul_mat_q4k` like existing quantized matmul ops
-
-**Reference (for dequant math only):** llama.cpp Vulkan shaders, MLC-LLM/WebLLM
+-   Add `Matrix::Q4K`, `Matrix::Q5K`, `Matrix::Q6K`, `Matrix::Q8_0` variants
+-   Create `matmul_vec_*.wgsl` and `matmul_mat_*.wgsl` shaders with inline dequantization
+-   Integrate via `TensorOp::matmul_*` like existing quantized matmul ops
 
 **Implementation Steps:**
 
--   [x] Create `Matrix::Q4K` variant in `tensor/matrix.rs`
--   [x] Add `matmul_vec_q4k.wgsl` shader with inline dequantization
--   [x] Add `matmul_mat_q4k.wgsl` shader with inline dequantization
--   [x] Implement `TensorOp::matmul_vec_q4k` and `matmul_mat_q4k` in `tensor/ops.rs`
--   [x] Update loader to create `Matrix::Q4K` directly from GGUF Q4_K data
+-   [x] Create `Matrix::Q4K/Q5K/Q6K/Q8_0` variants in `tensor/matrix.rs`
+-   [x] Add matmul shaders for all K-quant formats
+-   [x] Implement `TensorOp` operations in `tensor/ops.rs`
+-   [x] Update loader to create native Matrix variants from GGUF data
 -   [x] Benchmark against F16 path
 
-**Results (M2 Max, 0.1B model):**
+**Results:** Native Q4K shaders are **slower** than F16 dequant path (~50% slower prefill, ~37% slower generation). Currently disabled in favor of F16 dequantization.
 
-| Format      | File Size | Load Time | RAM Δ    | Prefill  | Generation |
-| ----------- | --------- | --------- | -------- | -------- | ---------- |
-| SafeTensors | 364.5 MB  | 1219 ms   | 889.0 MB | 2723 t/s | 168.7 t/s  |
-| GGUF Q4_K   | 126.4 MB  | 776 ms    | 201.4 MB | 2829 t/s | 169.5 t/s  |
+**Root Cause:** Per-element dequantization during matmul adds significant overhead. The F16 path dequantizes once at load time and uses highly optimized F16 matmul shaders.
 
-**Key findings:**
+### Phase 8: TVM/MLC-LLM Integration (Planned)
 
--   **65% smaller** file size
--   **36% faster** load time (no dequant→requant repacking)
--   **77% less RAM** during loading
--   **+4% prefill, +0.5% generation** - baseline implementation, not yet optimized
+**Goal:** Achieve 85% native performance for quantized matmul using Apache TVM compilation.
 
-**Next steps for optimization:**
+**Approach:** Integrate MLC-LLM's TVM-compiled kernels for optimized quantized inference.
 
--   [ ] Optimize shader with vectorized dequantization
--   [ ] Add shared memory tiling for better memory access patterns
--   [ ] Extend to Q5_K, Q6_K, Q8_0 formats
+**Why TVM:**
+
+-   WebLLM achieves 85% native Metal performance using TVM-generated WGSL
+-   Automatic fusion of dequantize + matmul operations
+-   Hardware-specific kernel tuning
+-   Proven approach - powers WebLLM in production
+
+**Implementation Steps:**
+
+1. [ ] **Setup MLC-LLM Environment**
+
+    - Install TVM Unity compiler
+    - Install MLC-LLM Python package
+    - Verify WebGPU target compilation works
+
+2. [ ] **Export RWKV Model to MLC Format**
+
+    - Define RWKV architecture in TVM Relax IR
+    - Apply q4f16_1 quantization (4-bit weights, f16 activations)
+    - Compile to WebGPU target with auto-tuning
+
+3. [ ] **Extract Compiled Kernels**
+
+    - Export WASM model library
+    - Extract optimized WGSL shaders
+    - Analyze kernel structure for integration
+
+4. [ ] **Integrate into web-rwkv**
+
+    - Option A: Use MLC-LLM runtime directly
+    - Option B: Port optimized kernels to web-rwkv shader system
+    - Option C: Hybrid - use MLC kernels for matmul, web-rwkv for rest
+
+5. [ ] **Benchmark and Validate**
+    - Compare against F16 dequant path
+    - Verify inference quality matches
+    - Test across different hardware (Metal, Vulkan, D3D12)
+
+**Expected Results:**
+
+-   85% of native GPU performance (vs current ~5% with hand-written shaders)
+-   Maintain 65% smaller file size
+-   Maintain 77% less RAM usage
+
+**Resources:**
+
+-   [MLC-LLM Compilation Guide](https://llm.mlc.ai/docs/compilation/compile_models.html)
+-   [TVM WebGPU Backend](https://tvm.apache.org/2020/05/14/compiling-machine-learning-to-webassembly-and-webgpu)
+-   [WebLLM GitHub](https://github.com/mlc-ai/web-llm)
+
+**Target:** Match or exceed F16 path performance while keeping quantization benefits
 
 ## GGUF File Structure Reference
 
