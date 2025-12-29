@@ -821,21 +821,28 @@ impl<R: Reader> Loader<R> {
                 log::info!("direct load (Q8_0 -> Int8): {name}");
                 Ok(Some(Matrix::Int8 { w, m }))
             }
-            (GgmlType::Q4K, Quant::Int8) => {
-                // Calculate actual elements from raw data size (Q4_K: 144 bytes per 256 elements)
+            (GgmlType::Q4K, Quant::Int8) | (GgmlType::Q4K, Quant::None) => {
+                // Native Q4_K loading - store raw blocks for inline dequantization during matmul
+                // This is faster than repacking to Int8 because it avoids dequant/requant overhead
                 let actual_elements = (raw_data.len() / 144) * 256;
                 if actual_elements != num_elements || num_elements % 256 != 0 {
                     return Ok(None); // Fall back to F16 path
                 }
-                let (weights, minmax) = repack_q4_k_to_int8(raw_data, num_elements);
 
-                let w: TensorGpu<u8, ReadWrite> = TensorCpu::from_data(shape, weights)?.to(context);
-                let m_shape = Shape::new(minmax.len(), 1, 1, 1);
-                let m: TensorGpu<f16, ReadWrite> =
-                    TensorCpu::from_data(m_shape, minmax)?.to(context);
+                // Create GPU tensor with raw Q4_K block data
+                let block_data_shape = Shape::new(raw_data.len(), 1, 1, 1);
+                let w: TensorGpu<u8, ReadWrite> =
+                    TensorGpu::from_data_u8(context, block_data_shape, raw_data)?;
 
-                log::info!("direct load (Q4_K -> Int8): {name}");
-                Ok(Some(Matrix::Int8 { w, m }))
+                // Create a dummy tensor with the logical matrix shape for metadata
+                let s: TensorGpu<u8, ReadWrite> = context.tensor_init(shape);
+
+                log::info!(
+                    "native Q4_K load: {name} ({} elements, {} bytes)",
+                    num_elements,
+                    raw_data.len()
+                );
+                Ok(Some(Matrix::Q4K { w, s }))
             }
             (GgmlType::Q5K, Quant::Int8) => {
                 // Calculate actual elements from raw data size (Q5_K: 176 bytes per 256 elements)

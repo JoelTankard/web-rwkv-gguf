@@ -78,6 +78,29 @@ Peak VRAM: Quantized only
 -   [x] Benchmark memory usage vs SafeTensors path
 -   [x] Document GGUF usage in README
 
+### Phase 7: Native Quantized Matmul Shaders
+
+**Goal:** Implement true quantized matrix multiplication that operates directly on packed 4-bit data without full dequantization, achieving actual compute speedup (not just memory savings).
+
+**Current Problem:** GGUF Q4_K tensors are dequantized to F16 at load time, so inference runs at F16 speed despite smaller file/RAM footprint.
+
+**Approach:** Extend existing web-rwkv WebGPU/WGSL infrastructure (NOT a new engine):
+
+-   Add `Matrix::Q4K` variant alongside existing `Fp16`, `Int8`, `Fp4`
+-   Create `matmul_mat_q4k.wgsl` following patterns in `src/shaders/`
+-   Integrate via `TensorOp::matmul_mat_q4k` like existing quantized matmul ops
+
+**Reference (for dequant math only):** llama.cpp Vulkan shaders, MLC-LLM/WebLLM
+
+**Implementation Steps:**
+
+-   [ ] Create `Matrix::Q4K` variant in `tensor/matrix.rs`
+-   [ ] Add `matmul_mat_q4k.wgsl` shader with inline dequantization
+-   [ ] Implement `TensorOp::matmul_mat_q4k` in `tensor/ops.rs`
+-   [ ] Update loader to create `Matrix::Q4K` directly from GGUF
+-   [ ] Benchmark against F16 path (target: 1.5-2x speedup on memory-bound ops)
+-   [ ] Extend to Q5_K, Q6_K, Q8_0 formats
+
 ## GGUF File Structure Reference
 
 ```

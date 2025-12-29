@@ -91,6 +91,16 @@ pub enum Matrix {
         w: TensorGpu<u8, ReadWrite>,
         m: TensorGpu<f16, ReadWrite>,
     },
+    /// Q4_K quantized matrix - stores raw GGUF Q4_K blocks for native quantized matmul.
+    /// Each super-block is 144 bytes encoding 256 elements (4.5 bits/element).
+    /// Layout: [d: f16, dmin: f16, scales: 12B, qs: 128B]
+    Q4K {
+        /// Raw Q4_K block data
+        w: TensorGpu<u8, ReadWrite>,
+        /// Metadata tensor for the logical matrix shape [K, M, B]
+        /// This is a dummy tensor used only for its shape metadata buffer.
+        s: TensorGpu<u8, ReadWrite>,
+    },
 }
 
 impl Matrix {
@@ -104,6 +114,7 @@ impl Matrix {
             Matrix::Fp16(matrix) => TensorOp::matmul_vec_fp16(matrix, input, output, act, false),
             Matrix::Int8 { w, m } => TensorOp::matmul_vec_int8(w, m, input, output, act, false),
             Matrix::Fp4 { w, q, m } => TensorOp::matmul_vec_nf4(w, q, m, input, output, act, false),
+            Matrix::Q4K { w, s } => TensorOp::matmul_vec_q4k(w, s, input, output, act),
         }
     }
 
@@ -117,6 +128,7 @@ impl Matrix {
             Matrix::Fp16(matrix) => TensorOp::matmul_vec_fp16(matrix, input, output, act, true),
             Matrix::Int8 { w, m } => TensorOp::matmul_vec_int8(w, m, input, output, act, true),
             Matrix::Fp4 { w, q, m } => TensorOp::matmul_vec_nf4(w, q, m, input, output, act, true),
+            Matrix::Q4K { w, s } => TensorOp::matmul_vec_q4k(w, s, input, output, act),
         }
     }
 
@@ -130,6 +142,7 @@ impl Matrix {
             Matrix::Fp16(matrix) => TensorOp::matmul_mat_fp16(matrix, input, output, act),
             Matrix::Int8 { w, m } => TensorOp::matmul_mat_int8(w, m, input, output, act),
             Matrix::Fp4 { w, q, m } => TensorOp::matmul_mat_nf4(w, q, m, input, output, act),
+            Matrix::Q4K { w, s } => TensorOp::matmul_mat_q4k(w, s, input, output, act),
         }
     }
 
