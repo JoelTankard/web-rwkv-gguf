@@ -1620,20 +1620,22 @@ impl<'a> super::loader::Reader for GgufReader<'a> {
             .ok_or_else(|| GgufError::TensorNotFound(name.to_string()))?;
         let mut shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
 
-        // Handle r_k tensor: GGUF stores as 1D [768], SafeTensors as 2D [num_head, head_dim]
-        // Infer num_head by looking up a1 tensor to get head_dim
+        // Handle r_k tensor: GGUF stores as 1D [emb], SafeTensors expects 2D [num_head, head_size]
+        // Get head_size from GGUF metadata (rwkv6.wkv.head_size or rwkv7.wkv.head_size)
         if shape.len() == 1 && name.ends_with(".att.r_k") {
-            if let Some(block_prefix) = name.strip_suffix(".att.r_k") {
-                let a1_name = format!("{}.att.a1", block_prefix);
-                if let Some(a1_gguf) = self.resolve_name(&a1_name) {
-                    if let Some(a1_info) = self.tensors.get(a1_gguf) {
-                        // a1 shape in GGUF is [emb, head_dim], so head_dim is dimensions[1]
-                        let head_dim = a1_info.dimensions[1] as usize;
-                        let total = shape[0];
-                        let num_head = total / head_dim;
-                        return Ok(vec![num_head, head_dim]);
-                    }
-                }
+            let head_size = self
+                .metadata
+                .get("rwkv7.wkv.head_size")
+                .or_else(|| self.metadata.get("rwkv6.wkv.head_size"))
+                .and_then(|v| match v {
+                    MetadataValue::Uint32(n) => Some(*n as usize),
+                    MetadataValue::Uint64(n) => Some(*n as usize),
+                    _ => None,
+                });
+            if let Some(head_size) = head_size {
+                let total = shape[0];
+                let num_head = total / head_size;
+                return Ok(vec![num_head, head_size]);
             }
         }
 
@@ -1736,20 +1738,24 @@ impl<'a> super::loader::Reader for GgufReader<'a> {
             .to_dtype()
             .ok_or_else(|| GgufError::UnsupportedTensorType(info.tensor_type))?;
 
-        // Handle r_k tensor: GGUF stores as 1D [768], SafeTensors as 2D [num_head, head_dim]
+        // Handle r_k tensor: GGUF stores as 1D [emb], SafeTensors expects 2D [num_head, head_size]
+        // Get head_size from GGUF metadata (rwkv6.wkv.head_size or rwkv7.wkv.head_size)
         if shape.len() == 1 && name.ends_with(".att.r_k") {
-            if let Some(block_prefix) = name.strip_suffix(".att.r_k") {
-                let a1_name = format!("{}.att.a1", block_prefix);
-                if let Some(a1_gguf) = self.resolve_name(&a1_name) {
-                    if let Some(a1_info) = self.tensors.get(a1_gguf) {
-                        let head_dim = a1_info.dimensions[1] as usize;
-                        let total = shape[0];
-                        let num_head = total / head_dim;
-                        // Return 2D shape [num_head, head_dim] for from_slice_rev
-                        let data = self.get_tensor_data(info);
-                        return Ok((dtype, vec![num_head, head_dim], Cow::Borrowed(data)));
-                    }
-                }
+            let head_size = self
+                .metadata
+                .get("rwkv7.wkv.head_size")
+                .or_else(|| self.metadata.get("rwkv6.wkv.head_size"))
+                .and_then(|v| match v {
+                    MetadataValue::Uint32(n) => Some(*n as usize),
+                    MetadataValue::Uint64(n) => Some(*n as usize),
+                    _ => None,
+                });
+            if let Some(head_size) = head_size {
+                let total = shape[0];
+                let num_head = total / head_size;
+                // Return 2D shape [num_head, head_size] for from_slice_rev
+                let data = self.get_tensor_data(info);
+                return Ok((dtype, vec![num_head, head_size], Cow::Borrowed(data)));
             }
         }
 
@@ -1776,7 +1782,7 @@ impl<'a> super::loader::Reader for GgufReader<'a> {
         let info = self.tensors.get(gguf_name)?;
 
         // Return data for quantized types that support direct loading
-        // Note: K-quants (Q4K, Q5K, Q6K) native shaders are slower than F16 dequant path
+        // Note: K-quants (Q4K, Q5K, Q6K) native shaders are currently slower than F16 dequant path
         // due to per-element dequantization overhead. Use F16 path for better performance.
         match info.tensor_type {
             GgmlType::Q8_0 | GgmlType::Q4_0 => {

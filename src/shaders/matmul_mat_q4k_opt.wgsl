@@ -27,22 +27,24 @@ struct Input {
 @group(0) @binding(5) var<storage, read_write> output: array<vec4<f32>>;    // (B, N, M)
 #endif
 
+// Optimized tile configuration
+// BLOCK_SIZE x BLOCK_SIZE threads per workgroup
+// Each thread computes a 4x4 output tile
+// Total output tile: (BLOCK_SIZE*4) x (BLOCK_SIZE*4) = TILE_SIZE x TILE_SIZE
 const TILE_SIZE: u32 = BLOCK_SIZE * 4u;
+
 const Q4K_BLOCK_SIZE: u32 = 256u;
 const Q4K_BLOCK_U32: u32 = 36u;
 
-// Shared memory for input tile (N dimension x K tile)
-// TILE_SIZE tokens x 64 vec4 (256 elements)
+// Shared memory for input tile (TILE_SIZE rows x BLOCK_SIZE vec4s)
 #ifdef IN_FP16
-var<workgroup> sb: array<array<vec2<u32>, 64>, TILE_SIZE>;
+var<workgroup> sb: array<array<vec2<u32>, BLOCK_SIZE>, TILE_SIZE>;
 #else
-var<workgroup> sb: array<array<vec4<f32>, 64>, TILE_SIZE>;
+var<workgroup> sb: array<array<vec4<f32>, BLOCK_SIZE>, TILE_SIZE>;
 #endif
 
-// Shared memory for dequantized weight tile
-// TILE_SIZE rows (M) x 64 vec4 (256 K elements)
-// Dequantize once, reuse across all N tokens in the tile
-var<workgroup> sa: array<array<vec4<f32>, 64>, TILE_SIZE>;
+// Shared memory for dequantized weight tile (TILE_SIZE rows x BLOCK_SIZE vec4s)
+var<workgroup> sa: array<array<vec4<f32>, BLOCK_SIZE>, TILE_SIZE>;
 
 // ACTIVATION_DEFINE
 
@@ -80,6 +82,56 @@ fn get_scale_min_k4(j: u32, scales_u32: array<u32, 3>) -> vec2<f32> {
     return vec2<f32>(f32(sc), f32(m));
 }
 
+// Dequantize a vec4 of elements from Q4_K at a given K position
+fn dequant_q4k_vec4(row: u32, k_pos: u32, num_super_blocks_k: u32) -> vec4<f32> {
+    let sb_idx = k_pos / Q4K_BLOCK_SIZE;
+    let pos_in_sb = k_pos % Q4K_BLOCK_SIZE;
+    
+    let block_u32_base = (row * num_super_blocks_k + sb_idx) * Q4K_BLOCK_U32;
+    let d_dmin = unpack2x16float(matrix[block_u32_base]);
+    let d = d_dmin.x;
+    let dmin = d_dmin.y;
+    
+    let scales_u32 = array<u32, 3>(
+        matrix[block_u32_base + 1u],
+        matrix[block_u32_base + 2u],
+        matrix[block_u32_base + 3u]
+    );
+    
+    // Determine j64 (which 64-element group) and position within
+    let j64 = pos_in_sb / 64u;
+    let pos_in_j64 = pos_in_sb % 64u;
+    
+    // Get scale/min for this position
+    let sm_idx = j64 * 2u + select(0u, 1u, pos_in_j64 >= 32u);
+    let sm = get_scale_min_k4(sm_idx, scales_u32);
+    let d_scale = d * sm.x;
+    let m_val = dmin * sm.y;
+    
+    // Get the packed qs byte
+    let l = (pos_in_j64 % 32u) / 4u;
+    let qs_packed = matrix[block_u32_base + 4u + j64 * 8u + l];
+    
+    var w: vec4<f32>;
+    if pos_in_j64 < 32u {
+        // Low nibbles
+        let q0 = f32(qs_packed & 0xFu);
+        let q1 = f32((qs_packed >> 8u) & 0xFu);
+        let q2 = f32((qs_packed >> 16u) & 0xFu);
+        let q3 = f32((qs_packed >> 24u) & 0xFu);
+        w = vec4<f32>(fma(d_scale, q0, -m_val), fma(d_scale, q1, -m_val), fma(d_scale, q2, -m_val), fma(d_scale, q3, -m_val));
+    } else {
+        // High nibbles
+        let q0 = f32((qs_packed >> 4u) & 0xFu);
+        let q1 = f32((qs_packed >> 12u) & 0xFu);
+        let q2 = f32((qs_packed >> 20u) & 0xFu);
+        let q3 = f32((qs_packed >> 28u) & 0xFu);
+        w = vec4<f32>(fma(d_scale, q0, -m_val), fma(d_scale, q1, -m_val), fma(d_scale, q2, -m_val), fma(d_scale, q3, -m_val));
+    }
+    
+    return w;
+}
+
 @compute @workgroup_size(BLOCK_SIZE, BLOCK_SIZE, 1)
 fn matmul(in: Input) {
     let k = va.shape.x;
@@ -87,114 +139,68 @@ fn matmul(in: Input) {
     let b = in.bid.xy * TILE_SIZE;
     let u = in.uid.xy * 4u;
     let t = in.tid.xy * 4u;
+    let ra = vec2<u32>(va.shape.x / 4u, va.shape.y);
     let rb = vec2<u32>(vb.shape.x / 4u, vb.shape.y);
-    
+    let stride = min(ra.x, rb.x);
     let num_super_blocks_k = k / Q4K_BLOCK_SIZE;
 
     var local_sum: mat4x4<f32>;
     
-    // Process K dimension in super-block sized tiles (256 elements = 64 vec4)
-    for (var sb_k = 0u; sb_k < num_super_blocks_k; sb_k++) {
-        let k_offset = sb_k * Q4K_BLOCK_SIZE;
-        
-        // Cooperatively load input tile (TILE_SIZE tokens x 64 vec4)
+    // Process K dimension in BLOCK_SIZE vec4 chunks (BLOCK_SIZE * 4 elements)
+    for (var kk = 0u; kk < stride; kk += BLOCK_SIZE) {
+        // Load TILE_SIZE rows of input and weights, each with BLOCK_SIZE vec4s
         for (var j = in.tid.y; j < TILE_SIZE; j += BLOCK_SIZE) {
-            for (var i = in.tid.x; i < 64u; i += BLOCK_SIZE) {
-                let y = b.y + j;
-                let x = k_offset / 4u + i;
-                if y < rb.y && x < rb.x {
-#ifdef IN_FP16
-                    sb[j][i] = xb[compute_index(vb, in.uid.z, y, x)];
-#else
-                    sb[j][i] = xb[compute_index(vb, in.uid.z, y, x)];
-#endif
-                } else {
-#ifdef IN_FP16
-                    sb[j][i] = vec2<u32>(0u);
-#else
-                    sb[j][i] = vec4<f32>(0.0);
-#endif
-                }
+            let i = in.tid.x;
+            let x = kk + i;
+            
+            // Load weight row (dequantize Q4_K on the fly)
+            var y = b.x + j;
+            if y < ra.y && x < ra.x {
+                let k_pos = x * 4u;  // Convert vec4 index to element index
+                sa[j][i] = dequant_q4k_vec4(y, k_pos, num_super_blocks_k);
+            } else {
+                sa[j][i] = vec4<f32>(0.0);
             }
-        }
-        
-        // Cooperatively dequantize weight tile (TILE_SIZE rows x 256 elements)
-        // Each thread handles multiple (row, k_element) pairs
-        for (var j = in.tid.y; j < TILE_SIZE; j += BLOCK_SIZE) {
-            let row = b.x + j;
-            if row >= m {
-                for (var i = in.tid.x; i < 64u; i += BLOCK_SIZE) {
-                    sa[j][i] = vec4<f32>(0.0);
-                }
-                continue;
-            }
-            
-            let block_u32_base = (row * num_super_blocks_k + sb_k) * Q4K_BLOCK_U32;
-            let d_dmin = unpack2x16float(matrix[block_u32_base]);
-            let d = d_dmin.x;
-            let dmin = d_dmin.y;
-            
-            let scales_u32 = array<u32, 3>(
-                matrix[block_u32_base + 1u],
-                matrix[block_u32_base + 2u],
-                matrix[block_u32_base + 3u]
-            );
-            
-            // Each thread dequantizes elements at stride BLOCK_SIZE
-            for (var i = in.tid.x; i < 32u; i += BLOCK_SIZE) {
-                let j64 = i / 8u;
-                let l = i % 8u;
-                
-                let is = j64 * 2u;
-                let sm0 = get_scale_min_k4(is, scales_u32);
-                let sm1 = get_scale_min_k4(is + 1u, scales_u32);
-                let d1 = d * sm0.x;
-                let m1 = dmin * sm0.y;
-                let d2 = d * sm1.x;
-                let m2 = dmin * sm1.y;
-                
-                let qs_packed = matrix[block_u32_base + 4u + j64 * 8u + l];
-                
-                let q0 = f32(qs_packed & 0xFu);
-                let q1 = f32((qs_packed >> 8u) & 0xFu);
-                let q2 = f32((qs_packed >> 16u) & 0xFu);
-                let q3 = f32((qs_packed >> 24u) & 0xFu);
-                let w_lo = vec4<f32>(fma(d1, q0, -m1), fma(d1, q1, -m1), fma(d1, q2, -m1), fma(d1, q3, -m1));
-                
-                let q4 = f32((qs_packed >> 4u) & 0xFu);
-                let q5 = f32((qs_packed >> 12u) & 0xFu);
-                let q6 = f32((qs_packed >> 20u) & 0xFu);
-                let q7 = f32((qs_packed >> 28u) & 0xFu);
-                let w_hi = vec4<f32>(fma(d2, q4, -m2), fma(d2, q5, -m2), fma(d2, q6, -m2), fma(d2, q7, -m2));
-                
-                sa[j][j64 * 16u + l] = w_lo;
-                sa[j][j64 * 16u + 8u + l] = w_hi;
+
+            // Load input row
+            y = b.y + j;
+            if all(vec2<u32>(x, y) < rb) {
+                sb[j][i] = xb[compute_index(vb, in.uid.z, y, x)];
+            } else {
+#ifdef IN_FP16
+                sb[j][i] = vec2<u32>(0u);
+#else
+                sb[j][i] = vec4<f32>(0.0);
+#endif
             }
         }
         workgroupBarrier();
-        
-        // Compute 4x4 output tile using cached weights and inputs
-        if all(u < vec2<u32>(m, rb.y)) {
-            for (var ki = 0u; ki < 64u; ki++) {
+
+        // Each thread multiplies and sums up 4x4 blocks along the reduced dimension
+        if all(u < vec2<u32>(ra.y, rb.y)) {
+            for (var x = 0u; x < BLOCK_SIZE; x += 1u) {
+                if kk + x >= stride {
+                    break;
+                }
                 let aa = mat4x4<f32>(
-                    sa[t.x][ki],
-                    sa[t.x + 1u][ki],
-                    sa[t.x + 2u][ki],
-                    sa[t.x + 3u][ki],
+                    sa[t.x][x],
+                    sa[t.x + 1u][x],
+                    sa[t.x + 2u][x],
+                    sa[t.x + 3u][x],
                 );
 #ifdef IN_FP16
                 let bb = mat4x4<f32>(
-                    unpack4x16float(sb[t.y][ki]),
-                    unpack4x16float(sb[t.y + 1u][ki]),
-                    unpack4x16float(sb[t.y + 2u][ki]),
-                    unpack4x16float(sb[t.y + 3u][ki]),
+                    unpack4x16float(sb[t.y][x]),
+                    unpack4x16float(sb[t.y + 1u][x]),
+                    unpack4x16float(sb[t.y + 2u][x]),
+                    unpack4x16float(sb[t.y + 3u][x]),
                 );
 #else
                 let bb = mat4x4<f32>(
-                    sb[t.y][ki],
-                    sb[t.y + 1u][ki],
-                    sb[t.y + 2u][ki],
-                    sb[t.y + 3u][ki],
+                    sb[t.y][x],
+                    sb[t.y + 1u][x],
+                    sb[t.y + 2u][x],
+                    sb[t.y + 3u][x],
                 );
 #endif
                 local_sum += transpose(aa) * bb;
@@ -203,7 +209,7 @@ fn matmul(in: Input) {
         workgroupBarrier();
     }
 
-    if all(u < vec2<u32>(m, rb.y)) {
+    if all(u < vec2<u32>(ra.y, rb.y)) {
         local_sum[0] = ACT(local_sum[0]);
         local_sum[1] = ACT(local_sum[1]);
         local_sum[2] = ACT(local_sum[2]);

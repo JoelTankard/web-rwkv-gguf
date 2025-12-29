@@ -22,10 +22,12 @@ struct View {
 #endif
 
 const Q4K_BLOCK_SIZE: u32 = 256u;
-const Q4K_BLOCK_BYTES: u32 = 144u;
 const Q4K_BLOCK_U32: u32 = 36u;
 
 var<workgroup> sketch: array<vec4<f32>, BLOCK_SIZE>;
+
+// Shared memory cache for input vector tile (64 vec4 = 256 elements)
+var<workgroup> input_cache: array<vec4<f32>, 64>;
 
 // ACTIVATION_DEFINE
 
@@ -70,11 +72,27 @@ fn get_scale_min_k4(j: u32, scales_u32: array<u32, 3>) -> vec2<f32> {
     return vec2<f32>(f32(sc), f32(m));
 }
 
+// Vectorized dequantization: process 8 elements from one u32 of packed qs
+fn dequant_8(qs_packed: u32, d1: f32, m1: f32, d2: f32, m2: f32, x_lo: vec4<f32>, x_hi: vec4<f32>) -> f32 {
+    let q0 = f32(qs_packed & 0xFu);
+    let q1 = f32((qs_packed >> 8u) & 0xFu);
+    let q2 = f32((qs_packed >> 16u) & 0xFu);
+    let q3 = f32((qs_packed >> 24u) & 0xFu);
+    let w_lo = vec4<f32>(fma(d1, q0, -m1), fma(d1, q1, -m1), fma(d1, q2, -m1), fma(d1, q3, -m1));
+    
+    let q4 = f32((qs_packed >> 4u) & 0xFu);
+    let q5 = f32((qs_packed >> 12u) & 0xFu);
+    let q6 = f32((qs_packed >> 20u) & 0xFu);
+    let q7 = f32((qs_packed >> 28u) & 0xFu);
+    let w_hi = vec4<f32>(fma(d2, q4, -m2), fma(d2, q5, -m2), fma(d2, q6, -m2), fma(d2, q7, -m2));
+    
+    return dot(w_lo, x_lo) + dot(w_hi, x_hi);
+}
+
 @compute @workgroup_size(BLOCK_SIZE, 1, 1)
-fn matmul(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
+fn matmul(@builtin(global_invocation_id) invocation_id: vec3<u32>, @builtin(local_invocation_index) tid: u32) {
     let k = va.shape.x;
     let m = va.shape.y;
-    let index = invocation_id.x % BLOCK_SIZE;
     let channel = invocation_id.x / BLOCK_SIZE;
     let token = invocation_id.y;
     let batch = invocation_id.z;
@@ -85,7 +103,8 @@ fn matmul(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
     
     var local_sum = vec4<f32>(0.0);
     
-    for (var sb = index; sb < num_super_blocks_k; sb += BLOCK_SIZE) {
+    // Each thread processes different super-blocks (strided across workgroup)
+    for (var sb = tid; sb < num_super_blocks_k; sb += BLOCK_SIZE) {
         let k_offset = sb * Q4K_BLOCK_SIZE;
         
         for (var r = 0u; r < 4u; r++) {
@@ -107,20 +126,20 @@ fn matmul(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
             );
             
             var row_sum = 0.0f;
-            var is = 0u;
             
+            // Process 4 groups of 64 elements each
             for (var j64 = 0u; j64 < 4u; j64++) {
-                let sm0 = get_scale_min_k4(is, scales_u32);
-                let sm1 = get_scale_min_k4(is + 1u, scales_u32);
+                let sm0 = get_scale_min_k4(j64 * 2u, scales_u32);
+                let sm1 = get_scale_min_k4(j64 * 2u + 1u, scales_u32);
                 let d1 = d * sm0.x;
                 let m1 = dmin * sm0.y;
                 let d2 = d * sm1.x;
                 let m2 = dmin * sm1.y;
                 
-                let qs_u32_base = block_u32_base + 4u + j64 * 8u;
+                let qs_base = block_u32_base + 4u + j64 * 8u;
                 
                 for (var l = 0u; l < 8u; l++) {
-                    let qs_packed = matrix[qs_u32_base + l];
+                    let qs_packed = matrix[qs_base + l];
                     
                     let elem_lo = k_offset + j64 * 64u + l * 4u;
                     let elem_hi = elem_lo + 32u;
@@ -135,38 +154,26 @@ fn matmul(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
                     let x_hi = input[input_idx_hi];
 #endif
                     
-                    let q0 = f32(qs_packed & 0xFu);
-                    let q1 = f32((qs_packed >> 8u) & 0xFu);
-                    let q2 = f32((qs_packed >> 16u) & 0xFu);
-                    let q3 = f32((qs_packed >> 24u) & 0xFu);
-                    let w_lo = vec4<f32>(d1 * q0 - m1, d1 * q1 - m1, d1 * q2 - m1, d1 * q3 - m1);
-                    
-                    let q4 = f32((qs_packed >> 4u) & 0xFu);
-                    let q5 = f32((qs_packed >> 12u) & 0xFu);
-                    let q6 = f32((qs_packed >> 20u) & 0xFu);
-                    let q7 = f32((qs_packed >> 28u) & 0xFu);
-                    let w_hi = vec4<f32>(d2 * q4 - m2, d2 * q5 - m2, d2 * q6 - m2, d2 * q7 - m2);
-                    
-                    row_sum += dot(w_lo, x_lo) + dot(w_hi, x_hi);
+                    row_sum += dequant_8(qs_packed, d1, m1, d2, m2, x_lo, x_hi);
                 }
-                is += 2u;
             }
+            
             local_sum[r] += row_sum;
         }
     }
     
-    sketch[index] = local_sum;
+    sketch[tid] = local_sum;
     workgroupBarrier();
 
-    reduce_sum(index, 64u);
-    reduce_sum(index, 32u);
-    reduce_sum(index, 16u);
-    reduce_sum(index, 8u);
-    reduce_sum(index, 4u);
-    reduce_sum(index, 2u);
-    reduce_sum(index, 1u);
+    reduce_sum(tid, 64u);
+    reduce_sum(tid, 32u);
+    reduce_sum(tid, 16u);
+    reduce_sum(tid, 8u);
+    reduce_sum(tid, 4u);
+    reduce_sum(tid, 2u);
+    reduce_sum(tid, 1u);
 
-    if index == 0u {
+    if tid == 0u {
         let btc = compute_index(destination, batch, token, channel);
         let out = ACT(sketch[0]);
 #ifdef OUT_FP16
