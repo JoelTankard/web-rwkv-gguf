@@ -220,6 +220,8 @@ Peak VRAM: Quantized only
 | Q5_K      | 13    | 256        | 5-bit K-quant  | ✅ Dequant to F16  |
 | Q6_K      | 14    | 256        | 6-bit K-quant  | ✅ Dequant to F16  |
 | Q8_K      | 15    | 256        | 8-bit K-quant  | ❌ Not implemented |
+| TQ1_0     | 34    | 256        | Ternary 1.6bpw | ✅ Dequant to F16  |
+| TQ2_0     | 35    | 256        | Ternary 2.1bpw | ✅ Dequant to F16  |
 | BF16      | 30    | 1          | bfloat16       | ✅ Supported       |
 
 ## RWKV Tensor Name Mapping
@@ -281,7 +283,6 @@ _Note: Actual RWKV GGUF naming may vary - will verify with real files._
 **Pending:**
 
 -   Update conversion script to support K-quants
--   Optimize Q4K shaders for better performance (currently baseline implementation)
 
 ## Benchmark Results (M2 Max, 0.1B model)
 

@@ -128,6 +128,16 @@ pub enum Matrix {
         /// Metadata tensor for the logical matrix shape [K, M, B]
         s: TensorGpu<u8, ReadWrite>,
     },
+    /// TQ2_0 quantized matrix - stores raw GGUF TQ2_0 blocks for native quantized matmul.
+    /// Each super-block is 66 bytes encoding 256 elements (~2.06 bits/element).
+    /// Layout: [qs: 64B (2 bits per weight, 4 per byte), d: f16]
+    /// Values map to {-1.5d, -0.5d, +0.5d, +1.5d}
+    TQ2_0 {
+        /// Raw TQ2_0 block data
+        w: TensorGpu<u8, ReadWrite>,
+        /// Metadata tensor for the logical matrix shape [K, M, B]
+        s: TensorGpu<u8, ReadWrite>,
+    },
 }
 
 impl Matrix {
@@ -145,6 +155,7 @@ impl Matrix {
             Matrix::Q5K { w, s } => TensorOp::matmul_vec_q5k(w, s, input, output, act),
             Matrix::Q6K { w, s } => TensorOp::matmul_vec_q6k(w, s, input, output, act),
             Matrix::Q8_0 { w, s } => TensorOp::matmul_vec_q8_0(w, s, input, output, act),
+            Matrix::TQ2_0 { w, s } => TensorOp::matmul_vec_tq2_0(w, s, input, output, act),
         }
     }
 
@@ -162,6 +173,7 @@ impl Matrix {
             Matrix::Q5K { w, s } => TensorOp::matmul_vec_q5k(w, s, input, output, act),
             Matrix::Q6K { w, s } => TensorOp::matmul_vec_q6k(w, s, input, output, act),
             Matrix::Q8_0 { w, s } => TensorOp::matmul_vec_q8_0(w, s, input, output, act),
+            Matrix::TQ2_0 { w, s } => TensorOp::matmul_vec_tq2_0(w, s, input, output, act),
         }
     }
 
@@ -179,6 +191,7 @@ impl Matrix {
             Matrix::Q5K { w, s } => TensorOp::matmul_mat_q5k(w, s, input, output, act),
             Matrix::Q6K { w, s } => TensorOp::matmul_mat_q6k(w, s, input, output, act),
             Matrix::Q8_0 { w, s } => TensorOp::matmul_mat_q8_0(w, s, input, output, act),
+            Matrix::TQ2_0 { w, s } => TensorOp::matmul_mat_tq2_0(w, s, input, output, act),
         }
     }
 

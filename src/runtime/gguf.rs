@@ -365,6 +365,99 @@ fn dequantize_q3_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
     output
 }
 
+/// Dequantize GGUF TQ1_0 data to F16.
+/// TQ1_0 format: 256 elements per super-block, ternary quantization (~1.6 bpw)
+/// Layout: [qs: 49 bytes (base-3 packed), qh: 4 bytes, d: f16] = 55 bytes
+/// Uses base-3 encoding: 5 ternary values (-1, 0, +1) packed per byte (3^5 = 243 < 256)
+fn dequantize_tq1_0_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 55; // 49 + 4 + 2
+
+    let num_blocks = num_elements / QK_K;
+    let mut output = Vec::with_capacity(num_elements * 2);
+
+    for block_idx in 0..num_blocks {
+        let block = &data[block_idx * BLOCK_BYTES..][..BLOCK_BYTES];
+
+        // Parse block: qs[49], qh[4], d (f16)
+        let qs = &block[0..49];
+        let qh = &block[49..53];
+        let d = f16::from_le_bytes([block[53], block[54]]).to_f32();
+
+        // Decode base-3 packed ternary values from qs (245 values from 49 bytes)
+        let mut element_idx = 0usize;
+        for &byte in qs.iter() {
+            let mut val = byte as u32;
+            for _ in 0..5 {
+                if element_idx >= 245 {
+                    break;
+                }
+                let trit = (val % 3) as i32 - 1; // Maps 0,1,2 -> -1,0,+1
+                val /= 3;
+                let dequant = (trit as f32) * d;
+                output.extend_from_slice(&f16::from_f32(dequant).to_le_bytes());
+                element_idx += 1;
+            }
+        }
+
+        // Decode remaining 11 values from qh[4] (using 2-bit encoding for edge cases)
+        // qh contains the remaining values in a different encoding
+        for i in 0..4 {
+            let byte = qh[i];
+            for j in 0..4 {
+                if element_idx >= QK_K {
+                    break;
+                }
+                let q2 = ((byte >> (j * 2)) & 0x3) as i32;
+                let trit = q2 - 1; // Maps 0,1,2,3 -> -1,0,1,2 (but we only use -1,0,1)
+                let dequant = (trit as f32) * d;
+                output.extend_from_slice(&f16::from_f32(dequant).to_le_bytes());
+                element_idx += 1;
+            }
+        }
+
+        // Pad if needed (shouldn't happen with correct data)
+        while element_idx < QK_K {
+            output.extend_from_slice(&f16::from_f32(0.0).to_le_bytes());
+            element_idx += 1;
+        }
+    }
+
+    output
+}
+
+/// Dequantize GGUF TQ2_0 data to F16.
+/// TQ2_0 format: 256 elements per super-block, 2-bit quantization (~2.1 bpw)
+/// Layout: [qs: 64 bytes (2 bits per weight), d: f16] = 66 bytes
+/// 4 weights packed per byte, values map to {-1.5d, -0.5d, +0.5d, +1.5d}
+fn dequantize_tq2_0_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 66; // 64 + 2
+
+    let num_blocks = num_elements / QK_K;
+    let mut output = Vec::with_capacity(num_elements * 2);
+
+    for block_idx in 0..num_blocks {
+        let block = &data[block_idx * BLOCK_BYTES..][..BLOCK_BYTES];
+
+        // Parse block: qs[64], d (f16)
+        let qs = &block[0..64];
+        let d = f16::from_le_bytes([block[64], block[65]]).to_f32();
+
+        // Decode 2-bit packed values (4 per byte)
+        for &byte in qs.iter() {
+            for j in 0..4 {
+                let q2 = ((byte >> (j * 2)) & 0x3) as i32;
+                // Map 0,1,2,3 -> -1.5, -0.5, +0.5, +1.5
+                let dequant = ((q2 as f32) - 1.5) * d;
+                output.extend_from_slice(&f16::from_f32(dequant).to_le_bytes());
+            }
+        }
+    }
+
+    output
+}
+
 /// Dequantize GGUF Q2_K data to F16.
 /// Q2_K format: 256 elements per super-block
 /// Layout: [scales: 16 bytes, qs: 64 bytes, d: f16, dmin: f16] = 84 bytes
@@ -1028,6 +1121,8 @@ impl GgmlType {
                 | GgmlType::Q5K
                 | GgmlType::Q6K
                 | GgmlType::Q8K
+                | GgmlType::TQ1_0
+                | GgmlType::TQ2_0
         )
     }
 
@@ -1053,6 +1148,8 @@ impl GgmlType {
             GgmlType::Q5K => 176, // block size 256
             GgmlType::Q6K => 210, // block size 256
             GgmlType::Q8K => 292, // block size 256
+            GgmlType::TQ1_0 => 55, // block size 256, ternary 1.6 bpw
+            GgmlType::TQ2_0 => 66, // block size 256, ternary 2.1 bpw
             _ => 0,               // Unknown or unsupported
         }
     }
@@ -1068,7 +1165,9 @@ impl GgmlType {
             | GgmlType::Q4K
             | GgmlType::Q5K
             | GgmlType::Q6K
-            | GgmlType::Q8K => 256,
+            | GgmlType::Q8K
+            | GgmlType::TQ1_0
+            | GgmlType::TQ2_0 => 256,
             _ => 1,
         }
     }
@@ -1700,6 +1799,8 @@ impl<'a> super::loader::Reader for GgufReader<'a> {
                 GgmlType::Q6K => (data.len() / 210) * 256,
                 GgmlType::Q3K => (data.len() / 110) * 256,
                 GgmlType::Q2K => (data.len() / 84) * 256,
+                GgmlType::TQ1_0 => (data.len() / 55) * 256,
+                GgmlType::TQ2_0 => (data.len() / 66) * 256,
                 _ => num_elements,
             };
 
@@ -1711,6 +1812,8 @@ impl<'a> super::loader::Reader for GgufReader<'a> {
                 GgmlType::Q6K => dequantize_q6_k_to_f16(data, actual_elements),
                 GgmlType::Q3K => dequantize_q3_k_to_f16(data, actual_elements),
                 GgmlType::Q2K => dequantize_q2_k_to_f16(data, actual_elements),
+                GgmlType::TQ1_0 => dequantize_tq1_0_to_f16(data, actual_elements),
+                GgmlType::TQ2_0 => dequantize_tq2_0_to_f16(data, actual_elements),
                 _ => return Err(GgufError::UnsupportedTensorType(info.tensor_type).into()),
             };
 

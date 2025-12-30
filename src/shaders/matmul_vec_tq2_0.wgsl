@@ -1,0 +1,155 @@
+struct View {
+    shape: vec4<u32>,
+    stride: vec4<u32>,
+    offset: vec4<u32>,
+};
+
+@group(0) @binding(0) var<uniform> va: View;                                // [K, M, B] logical matrix shape
+@group(0) @binding(1) var<uniform> source: View;                            // [K, T, B] input
+@group(0) @binding(2) var<uniform> destination: View;                       // [M, T, B] output
+
+@group(0) @binding(3) var<storage, read> matrix: array<u32>;                // TQ2_0 blocks (66 bytes per 256 elements)
+
+#ifdef IN_FP16
+@group(0) @binding(4) var<storage, read> input: array<vec2<u32>>;           // (B, T, K)
+#else
+@group(0) @binding(4) var<storage, read> input: array<vec4<f32>>;           // (B, T, K)
+#endif
+#ifdef OUT_FP16
+@group(0) @binding(5) var<storage, read_write> output: array<vec2<u32>>;    // (B, T, M)
+#else
+@group(0) @binding(5) var<storage, read_write> output: array<vec4<f32>>;    // (B, T, M)
+#endif
+
+const TQ2_0_BLOCK_SIZE: u32 = 256u;
+const TQ2_0_BLOCK_U32S: u32 = 17u;  // 68 bytes = 17 u32s (padded from 66 for alignment)
+
+var<workgroup> sketch: array<vec4<f32>, BLOCK_SIZE>;
+var<workgroup> input_cache: array<vec4<f32>, 64u>;
+
+// ACTIVATION_DEFINE
+
+fn compute_index(view: View, batch: u32, token: u32, index: u32) -> u32 {
+    let stride = view.stride.x >> 2u;
+    let offset = vec3<u32>(view.offset.zy, view.offset.x >> 2u);
+    return dot(vec3<u32>(batch, token, index) + offset, vec3<u32>(view.stride.y * stride, stride, 1u));
+}
+
+fn pack4x16float(x: vec4<f32>) -> vec2<u32> {
+    return vec2<u32>(pack2x16float(x.xy), pack2x16float(x.zw));
+}
+
+fn unpack4x16float(x: vec2<u32>) -> vec4<f32> {
+    return vec4<f32>(unpack2x16float(x.x), unpack2x16float(x.y));
+}
+
+fn reduce_sum(index: u32, stride: u32) {
+    if index < stride {
+        sketch[index] += sketch[index + stride];
+    }
+    workgroupBarrier();
+}
+
+fn dequant_tq2_0_vec4(byte_val: u32) -> vec4<f32> {
+    // TQ2_0: 2 bits per weight, 4 weights per byte
+    // Values 0,1,2,3 map to -1.5, -0.5, +0.5, +1.5
+    let q0 = f32((byte_val >> 0u) & 3u) - 1.5;
+    let q1 = f32((byte_val >> 2u) & 3u) - 1.5;
+    let q2 = f32((byte_val >> 4u) & 3u) - 1.5;
+    let q3 = f32((byte_val >> 6u) & 3u) - 1.5;
+    return vec4<f32>(q0, q1, q2, q3);
+}
+
+@compute @workgroup_size(BLOCK_SIZE, 1, 1)
+fn matmul(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
+    let k = va.shape.x;
+    let m = va.shape.y;
+    let index = invocation_id.x % BLOCK_SIZE;
+    let channel = invocation_id.x / BLOCK_SIZE;
+    let token = invocation_id.y;
+    let batch = invocation_id.z;
+
+    let bb = compute_index(source, batch, token, 0u);
+    let num_blocks_k = k / TQ2_0_BLOCK_SIZE;
+    let row = channel * 4u;
+    
+    var local_sum = vec4<f32>(0.0);
+    
+    for (var blk = index; blk < num_blocks_k; blk += BLOCK_SIZE) {
+        let k_offset = blk * TQ2_0_BLOCK_SIZE;
+        
+        // Load input tile into shared memory (256 elements = 64 vec4s)
+        if index < 64u {
+            let input_idx = bb + k_offset / 4u + index;
+#ifdef IN_FP16
+            input_cache[index] = unpack4x16float(input[input_idx]);
+#else
+            input_cache[index] = input[input_idx];
+#endif
+        }
+        workgroupBarrier();
+        
+        for (var r = 0u; r < 4u; r++) {
+            let current_row = row + r;
+            if current_row >= m {
+                continue;
+            }
+            
+            // TQ2_0 block layout (padded to 68 bytes = 17 u32s):
+            // [qs: 64 bytes (16 u32s), d: f16, padding: 2 bytes]
+            let block_idx = current_row * num_blocks_k + blk;
+            let block_u32_base = block_idx * TQ2_0_BLOCK_U32S;
+            
+            // Read scale from u32 index 16 (bytes 64-65)
+            let d = unpack2x16float(matrix[block_u32_base + 16u]).x;
+            
+            var row_sum = 0.0f;
+            
+            // Process 16 u32s of qs (64 bytes = 256 2-bit values = 64 vec4s of weights)
+            for (var l = 0u; l < 16u; l++) {
+                let qs_packed = matrix[block_u32_base + l];
+                
+                // Each u32 contains 4 bytes = 16 2-bit values = 4 vec4s
+                let byte0 = (qs_packed >> 0u) & 0xFFu;
+                let byte1 = (qs_packed >> 8u) & 0xFFu;
+                let byte2 = (qs_packed >> 16u) & 0xFFu;
+                let byte3 = (qs_packed >> 24u) & 0xFFu;
+                
+                let w0 = d * dequant_tq2_0_vec4(byte0);
+                let w1 = d * dequant_tq2_0_vec4(byte1);
+                let w2 = d * dequant_tq2_0_vec4(byte2);
+                let w3 = d * dequant_tq2_0_vec4(byte3);
+                
+                let cache_base = l * 4u;
+                row_sum += dot(w0, input_cache[cache_base + 0u]);
+                row_sum += dot(w1, input_cache[cache_base + 1u]);
+                row_sum += dot(w2, input_cache[cache_base + 2u]);
+                row_sum += dot(w3, input_cache[cache_base + 3u]);
+            }
+            
+            local_sum[r] += row_sum;
+        }
+        workgroupBarrier();
+    }
+    
+    sketch[index] = local_sum;
+    workgroupBarrier();
+
+    reduce_sum(index, 64u);
+    reduce_sum(index, 32u);
+    reduce_sum(index, 16u);
+    reduce_sum(index, 8u);
+    reduce_sum(index, 4u);
+    reduce_sum(index, 2u);
+    reduce_sum(index, 1u);
+
+    if index == 0u {
+        let btc = compute_index(destination, batch, token, channel);
+        let out = ACT(sketch[0]);
+#ifdef OUT_FP16
+        output[btc] = pack4x16float(out);
+#else
+        output[btc] = out;
+#endif
+    }
+}

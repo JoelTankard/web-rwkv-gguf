@@ -898,6 +898,10 @@ impl<R: Reader> Loader<R> {
                 );
                 Ok(Some(Matrix::Q8_0 { w, s }))
             }
+            // Note: TQ2_0 native shaders exist but are slower than F16 dequant path due to
+            // per-element dequantization overhead. Fall through to F16 path for better inference speed.
+            // Native TQ2_0 can be enabled by uncommenting below for memory-constrained scenarios.
+            // (GgmlType::TQ2_0, Quant::None) | (GgmlType::TQ2_0, Quant::Int8) => { ... }
             (GgmlType::Q4_0, Quant::NF4) => {
                 // Direct Q4_0 -> NF4 repacking
                 let (weights, absmax) = repack_q4_0_to_nf4(raw_data, num_elements);
