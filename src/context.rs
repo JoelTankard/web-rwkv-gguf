@@ -13,10 +13,13 @@ use wgpu::{
     RequestAdapterOptions, ShaderModuleDescriptor, Trace,
 };
 
-use crate::tensor::{
-    cache::{ResourceCache, SharedResourceCache},
-    shape::{IntoBytes, Shape},
-    ResourceKey, TensorResource, View,
+use crate::{
+    profiler::GpuProfiler,
+    tensor::{
+        cache::{ResourceCache, SharedResourceCache},
+        shape::{IntoBytes, Shape},
+        ResourceKey, TensorResource, View,
+    },
 };
 
 pub trait InstanceExt {
@@ -53,6 +56,7 @@ pub struct Context {
     pub adapter: Adapter,
     pub device: Device,
     pub queue: Queue,
+    pub profiler: GpuProfiler,
 
     pipelines: SharedResourceCache<PipelineKey, CachedPipeline>,
     shapes: ResourceCache<View, Buffer>,
@@ -132,11 +136,14 @@ impl ContextBuilder {
         #[cfg(not(target_arch = "wasm32"))]
         let (event, receiver) = flume::unbounded();
 
+        let profiler = GpuProfiler::new(&device, &queue);
+
         let context = Context {
             id: uid::Id::new(),
             adapter,
             device,
             queue,
+            profiler,
             pipelines: Default::default(),
             shapes: Default::default(),
             buffers: ResourceCache::new(4),

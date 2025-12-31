@@ -77,6 +77,14 @@ impl<T: Scalar, K: Kind> TensorCommand<T, K> for CommandEncoder {
 
 impl crate::context::Context {
     pub fn encode(&self, op: &TensorOp) -> Vec<CommandBuffer> {
+        self.encode_inner(op, false)
+    }
+
+    pub fn encode_profiled(&self, op: &TensorOp) -> Vec<CommandBuffer> {
+        self.encode_inner(op, true)
+    }
+
+    fn encode_inner(&self, op: &TensorOp, profile: bool) -> Vec<CommandBuffer> {
         struct Atom<'a> {
             pipeline: &'a CachedPipeline,
             bindings: &'a [Arc<BindGroup>],
@@ -127,16 +135,30 @@ impl crate::context::Context {
         flatten(&mut commands, &mut passes, op);
         commands.push(passes);
 
+        let profiler = &self.profiler;
+        let should_profile = profile && profiler.is_enabled();
+
         commands
             .into_iter()
-            .filter(|atoms| !atoms.is_empty())
-            .map(|atoms| {
+            .enumerate()
+            .filter(|(_, atoms)| !atoms.is_empty())
+            .map(|(batch_idx, atoms)| {
                 let mut encoder = self.device.create_command_encoder(&Default::default());
+
+                if should_profile {
+                    profiler.begin_query(&mut encoder, &format!("batch_{}", batch_idx));
+                }
+
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 for atom in atoms {
                     dispatch(&mut pass, atom);
                 }
                 drop(pass);
+
+                if should_profile {
+                    profiler.end_query(&mut encoder, &format!("batch_{}", batch_idx));
+                }
+
                 encoder.finish()
             })
             .collect()
