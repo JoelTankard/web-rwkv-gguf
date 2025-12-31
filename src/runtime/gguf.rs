@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use half::f16;
 use safetensors::{Dtype, SafeTensorError};
@@ -88,13 +88,78 @@ fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
-/// Dequantize GGUF Q4_K data to F16.
+/// Dequantize GGUF Q4_K data to F16 (parallel version for native builds).
 /// Q4_K format: 256 elements per super-block
 /// Layout: [d: f16, dmin: f16, scales: 12 bytes, qs: 128 bytes] = 144 bytes
 /// 8 sub-blocks of 32 elements each, scales/mins quantized with 6 bits
+#[cfg(not(target_arch = "wasm32"))]
+fn dequantize_q4_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
+    use rayon::prelude::*;
+
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 144;
+    const OUTPUT_BYTES_PER_BLOCK: usize = QK_K * 2;
+
+    let num_blocks = num_elements / QK_K;
+
+    let results: Vec<[u8; OUTPUT_BYTES_PER_BLOCK]> = (0..num_blocks)
+        .into_par_iter()
+        .map(|block_idx| {
+            let block = &data[block_idx * BLOCK_BYTES..][..BLOCK_BYTES];
+            let mut block_output = [0u8; OUTPUT_BYTES_PER_BLOCK];
+
+            let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
+            let scales = &block[4..16];
+            let qs = &block[16..144];
+
+            let mut out_idx = 0usize;
+            let mut is = 0usize;
+            for j in (0..QK_K).step_by(64) {
+                let (sc0, m0) = get_scale_min_k4(is, scales);
+                let (sc1, m1) = get_scale_min_k4(is + 1, scales);
+
+                let d1 = d * (sc0 as f32);
+                let m1_val = dmin * (m0 as f32);
+                let d2 = d * (sc1 as f32);
+                let m2_val = dmin * (m1 as f32);
+
+                let q_offset = j / 2;
+
+                for l in 0..32 {
+                    let q_byte = qs[q_offset + l];
+                    let val = d1 * ((q_byte & 0xF) as f32) - m1_val;
+                    let bytes = f16::from_f32(val).to_le_bytes();
+                    block_output[out_idx] = bytes[0];
+                    block_output[out_idx + 1] = bytes[1];
+                    out_idx += 2;
+                }
+                for l in 0..32 {
+                    let q_byte = qs[q_offset + l];
+                    let val = d2 * ((q_byte >> 4) as f32) - m2_val;
+                    let bytes = f16::from_f32(val).to_le_bytes();
+                    block_output[out_idx] = bytes[0];
+                    block_output[out_idx + 1] = bytes[1];
+                    out_idx += 2;
+                }
+                is += 2;
+            }
+            block_output
+        })
+        .collect();
+
+    let mut output = Vec::with_capacity(num_elements * 2);
+    for block_output in results {
+        output.extend_from_slice(&block_output);
+    }
+    output
+}
+
+/// Q4_K dequantization for WASM (single-threaded)
+#[cfg(target_arch = "wasm32")]
 fn dequantize_q4_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
     const QK_K: usize = 256;
-    const BLOCK_BYTES: usize = 144; // 2 + 2 + 12 + 128
+    const BLOCK_BYTES: usize = 144;
 
     let num_blocks = num_elements / QK_K;
     let mut output = Vec::with_capacity(num_elements * 2);
@@ -102,14 +167,11 @@ fn dequantize_q4_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
     for block_idx in 0..num_blocks {
         let block = &data[block_idx * BLOCK_BYTES..][..BLOCK_BYTES];
 
-        // Parse header: d (f16), dmin (f16)
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
-        let scales = &block[4..16]; // 12 bytes
-        let qs = &block[16..144]; // 128 bytes
+        let scales = &block[4..16];
+        let qs = &block[16..144];
 
-        // Process 8 sub-blocks of 32 elements (but qs packs 64 elements per 32 bytes)
-        // Each byte in qs contains 2 4-bit values
         let mut is = 0usize;
         for j in (0..QK_K).step_by(64) {
             let (sc0, m0) = get_scale_min_k4(is, scales);
@@ -120,25 +182,21 @@ fn dequantize_q4_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
             let d2 = d * (sc1 as f32);
             let m2_val = dmin * (m1 as f32);
 
-            let q_offset = j / 2; // 32 bytes per 64 elements
+            let q_offset = j / 2;
 
-            // First 32 elements (low nibble)
             for l in 0..32 {
                 let q_byte = qs[q_offset + l];
                 let val = d1 * ((q_byte & 0xF) as f32) - m1_val;
                 output.extend_from_slice(&f16::from_f32(val).to_le_bytes());
             }
-            // Next 32 elements (high nibble)
             for l in 0..32 {
                 let q_byte = qs[q_offset + l];
                 let val = d2 * ((q_byte >> 4) as f32) - m2_val;
                 output.extend_from_slice(&f16::from_f32(val).to_le_bytes());
             }
-
             is += 2;
         }
     }
-
     output
 }
 
@@ -207,9 +265,101 @@ fn dequantize_q5_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
 /// Q6_K format: 256 elements per super-block
 /// Layout: [ql: 128 bytes, qh: 64 bytes, scales: 16 bytes, d: f16] = 210 bytes
 /// 16 sub-blocks of 16 elements each, 6-bit quantization (4 low + 2 high)
+#[cfg(not(target_arch = "wasm32"))]
+fn dequantize_q6_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
+    use rayon::prelude::*;
+
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 210;
+    const OUTPUT_BYTES_PER_BLOCK: usize = QK_K * 2;
+
+    let num_blocks = num_elements / QK_K;
+
+    // Process blocks in parallel
+    let results: Vec<[u8; OUTPUT_BYTES_PER_BLOCK]> = (0..num_blocks)
+        .into_par_iter()
+        .map(|block_idx| {
+            let block = &data[block_idx * BLOCK_BYTES..][..BLOCK_BYTES];
+            let mut block_output = [0u8; OUTPUT_BYTES_PER_BLOCK];
+
+            let ql = &block[0..128];
+            let qh = &block[128..192];
+            let scales = &block[192..208];
+            let d = f16::from_le_bytes([block[208], block[209]]).to_f32();
+
+            let mut out_idx = 0usize;
+            let mut ql_idx = 0usize;
+            let mut qh_idx = 0usize;
+            let mut sc_idx = 0usize;
+
+            for _n in (0..QK_K).step_by(128) {
+                for l in 0..32 {
+                    let is = l / 16;
+                    let q1 =
+                        ((ql[ql_idx + l] & 0xF) | (((qh[qh_idx + l] >> 0) & 3) << 4)) as i8 - 32;
+                    let sc0 = scales[sc_idx + is] as i8;
+                    let val = d * (sc0 as f32) * (q1 as f32);
+                    let bytes = f16::from_f32(val).to_le_bytes();
+                    block_output[out_idx] = bytes[0];
+                    block_output[out_idx + 1] = bytes[1];
+                    out_idx += 2;
+                }
+                for l in 0..32 {
+                    let is = l / 16;
+                    let q2 = ((ql[ql_idx + l + 32] & 0xF) | (((qh[qh_idx + l] >> 2) & 3) << 4))
+                        as i8
+                        - 32;
+                    let sc2 = scales[sc_idx + is + 2] as i8;
+                    let val = d * (sc2 as f32) * (q2 as f32);
+                    let bytes = f16::from_f32(val).to_le_bytes();
+                    block_output[out_idx] = bytes[0];
+                    block_output[out_idx + 1] = bytes[1];
+                    out_idx += 2;
+                }
+                for l in 0..32 {
+                    let is = l / 16;
+                    let q3 =
+                        ((ql[ql_idx + l] >> 4) | (((qh[qh_idx + l] >> 4) & 3) << 4)) as i8 - 32;
+                    let sc4 = scales[sc_idx + is + 4] as i8;
+                    let val = d * (sc4 as f32) * (q3 as f32);
+                    let bytes = f16::from_f32(val).to_le_bytes();
+                    block_output[out_idx] = bytes[0];
+                    block_output[out_idx + 1] = bytes[1];
+                    out_idx += 2;
+                }
+                for l in 0..32 {
+                    let is = l / 16;
+                    let q4 = ((ql[ql_idx + l + 32] >> 4) | (((qh[qh_idx + l] >> 6) & 3) << 4))
+                        as i8
+                        - 32;
+                    let sc6 = scales[sc_idx + is + 6] as i8;
+                    let val = d * (sc6 as f32) * (q4 as f32);
+                    let bytes = f16::from_f32(val).to_le_bytes();
+                    block_output[out_idx] = bytes[0];
+                    block_output[out_idx + 1] = bytes[1];
+                    out_idx += 2;
+                }
+                ql_idx += 64;
+                qh_idx += 32;
+                sc_idx += 8;
+            }
+            block_output
+        })
+        .collect();
+
+    // Flatten results
+    let mut output = Vec::with_capacity(num_elements * 2);
+    for block_output in results {
+        output.extend_from_slice(&block_output);
+    }
+    output
+}
+
+/// Q6_K dequantization for WASM (single-threaded)
+#[cfg(target_arch = "wasm32")]
 fn dequantize_q6_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
     const QK_K: usize = 256;
-    const BLOCK_BYTES: usize = 210; // 128 + 64 + 16 + 2
+    const BLOCK_BYTES: usize = 210;
 
     let num_blocks = num_elements / QK_K;
     let mut output = Vec::with_capacity(num_elements * 2);
@@ -217,19 +367,16 @@ fn dequantize_q6_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
     for block_idx in 0..num_blocks {
         let block = &data[block_idx * BLOCK_BYTES..][..BLOCK_BYTES];
 
-        // Parse block (note: d is at the END for Q6_K)
         let ql = &block[0..128];
         let qh = &block[128..192];
-        let scales = &block[192..208]; // int8_t scales[16]
+        let scales = &block[192..208];
         let d = f16::from_le_bytes([block[208], block[209]]).to_f32();
 
-        // Process in chunks of 128 elements (2 iterations for 256 total)
         let mut ql_idx = 0usize;
         let mut qh_idx = 0usize;
         let mut sc_idx = 0usize;
 
         for _n in (0..QK_K).step_by(128) {
-            // Output positions 0-31
             for l in 0..32 {
                 let is = l / 16;
                 let q1 = ((ql[ql_idx + l] & 0xF) | (((qh[qh_idx + l] >> 0) & 3) << 4)) as i8 - 32;
@@ -237,7 +384,6 @@ fn dequantize_q6_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
                 let val = d * (sc0 as f32) * (q1 as f32);
                 output.extend_from_slice(&f16::from_f32(val).to_le_bytes());
             }
-            // Output positions 32-63
             for l in 0..32 {
                 let is = l / 16;
                 let q2 =
@@ -246,7 +392,6 @@ fn dequantize_q6_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
                 let val = d * (sc2 as f32) * (q2 as f32);
                 output.extend_from_slice(&f16::from_f32(val).to_le_bytes());
             }
-            // Output positions 64-95
             for l in 0..32 {
                 let is = l / 16;
                 let q3 = ((ql[ql_idx + l] >> 4) | (((qh[qh_idx + l] >> 4) & 3) << 4)) as i8 - 32;
@@ -254,7 +399,6 @@ fn dequantize_q6_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
                 let val = d * (sc4 as f32) * (q3 as f32);
                 output.extend_from_slice(&f16::from_f32(val).to_le_bytes());
             }
-            // Output positions 96-127
             for l in 0..32 {
                 let is = l / 16;
                 let q4 =
@@ -263,13 +407,11 @@ fn dequantize_q6_k_to_f16(data: &[u8], num_elements: usize) -> Vec<u8> {
                 let val = d * (sc6 as f32) * (q4 as f32);
                 output.extend_from_slice(&f16::from_f32(val).to_le_bytes());
             }
-
             ql_idx += 64;
             qh_idx += 32;
             sc_idx += 8;
         }
     }
-
     output
 }
 
@@ -1157,6 +1299,18 @@ pub struct GgufReader<'a> {
     name_map: HashMap<String, String>,
 }
 
+/// An owned version of GgufReader that holds data via Arc for zero-copy lazy loading.
+/// The Arc allows sharing the mmap data with LazyMatrix without copying.
+pub struct ArcGgufReader {
+    data: Arc<[u8]>,
+    pub version: u32,
+    pub tensor_count: u64,
+    pub metadata: HashMap<String, MetadataValue>,
+    pub tensors: HashMap<String, TensorInfo>,
+    pub tensor_data_offset: u64,
+    name_map: HashMap<String, String>,
+}
+
 fn build_rwkv_name_map(tensors: &HashMap<String, TensorInfo>) -> HashMap<String, String> {
     let mut map = HashMap::new();
 
@@ -1409,6 +1563,64 @@ impl<'a> GgufReader<'a> {
 
     pub fn get_metadata(&self, key: &str) -> Option<&MetadataValue> {
         self.metadata.get(key)
+    }
+}
+
+impl ArcGgufReader {
+    /// Create an ArcGgufReader from Arc-wrapped data (e.g., from mmap).
+    /// This enables zero-copy lazy loading by sharing the Arc with LazyMatrix.
+    pub fn new(data: Arc<[u8]>) -> Result<Self, GgufError> {
+        // Parse metadata using borrowed reader, then transfer ownership
+        let (version, tensor_count, metadata, tensors, tensor_data_offset, name_map) = {
+            let borrowed = GgufReader::new(&data)?;
+            (
+                borrowed.version,
+                borrowed.tensor_count,
+                borrowed.metadata,
+                borrowed.tensors,
+                borrowed.tensor_data_offset,
+                borrowed.name_map,
+            )
+        };
+
+        Ok(Self {
+            data,
+            version,
+            tensor_count,
+            metadata,
+            tensors,
+            tensor_data_offset,
+            name_map,
+        })
+    }
+
+    /// Get the shared Arc data reference - this is the key for zero-copy.
+    pub fn shared_data(&self) -> &Arc<[u8]> {
+        &self.data
+    }
+
+    /// Get tensor slice info for zero-copy lazy loading.
+    /// Returns (shared_arc, offset, length) so LazyMatrix can reference without copying.
+    pub fn get_tensor_slice_info(&self, name: &str) -> Option<(Arc<[u8]>, usize, usize)> {
+        let gguf_name = self.name_map.get(name)?;
+        let info = self.tensors.get(gguf_name)?;
+        let start = (self.tensor_data_offset + info.offset) as usize;
+        let len = info.data_size();
+        Some((self.data.clone(), start, len))
+    }
+
+    pub fn get_tensor_data(&self, info: &TensorInfo) -> &[u8] {
+        let start = (self.tensor_data_offset + info.offset) as usize;
+        let end = start + info.data_size();
+        &self.data[start..end]
+    }
+
+    pub fn get_metadata(&self, key: &str) -> Option<&MetadataValue> {
+        self.metadata.get(key)
+    }
+
+    fn resolve_name(&self, name: &str) -> Option<&str> {
+        self.name_map.get(name).map(|s| s.as_str())
     }
 }
 
@@ -1782,8 +1994,8 @@ impl<'a> super::loader::Reader for GgufReader<'a> {
         let info = self.tensors.get(gguf_name)?;
 
         // Return data for quantized types that support direct loading
-        // Note: K-quants (Q4K, Q5K, Q6K) native shaders are currently slower than F16 dequant path
-        // due to per-element dequantization overhead. Use F16 path for better performance.
+        // Note: K-quants (Q4K, Q5K, Q6K) native shaders exist but may have issues
+        // Only enable Q8_0 and Q4_0 which are well-tested
         match info.tensor_type {
             GgmlType::Q8_0 | GgmlType::Q4_0 => {
                 let data = self.get_tensor_data(info);
