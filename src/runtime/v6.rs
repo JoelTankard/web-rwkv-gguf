@@ -1132,12 +1132,6 @@ impl<R: Reader> ModelBuilder<R> {
                 w_v: load_matrix_discount(format!("{ffn}.value.weight"), quant, discount)?,
             };
 
-            let submission_index = Some(context.queue.submit(None));
-            _ = context.device.poll(wgpu::PollType::Wait {
-                submission_index,
-                timeout: None,
-            });
-
             layers.push(Layer {
                 att_layer_norm,
                 ffn_layer_norm,
@@ -1145,12 +1139,6 @@ impl<R: Reader> ModelBuilder<R> {
                 ffn,
             })
         }
-
-        let submission_index = Some(context.queue.submit(None));
-        _ = context.device.poll(wgpu::PollType::Wait {
-            submission_index,
-            timeout: None,
-        });
 
         let tensor = ModelTensor {
             embed,
