@@ -466,3 +466,50 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 
 </details>
 
+## State Readback Optimization
+
+### 2025-12-31 06:42:30 - Baseline before optimization
+
+| Metric | Value |
+|--------|-------|
+| Model | rwkv7-g1b-2.9b-20251205-ctx8192-Q4_K_M.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4942.49 ms** |
+| **Prefill** | **146.43 tok/s** |
+| **Generation** | **40.62 tok/s** |
+| Quality Hash | `3895ad4add71cff0` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129]
+```
+
+</details>
+
+
+### 2025-12-31 06:46:57 - After optimized state readback + embed API
+
+| Metric | Value |
+|--------|-------|
+| Model | rwkv7-g1b-2.9b-20251205-ctx8192-Q4_K_M.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **5063.54 ms** |
+| **Prefill** | **146.20 tok/s** |
+| **Generation** | **40.32 tok/s** |
+| Quality Hash | `3895ad4add71cff0` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129]
+```
+
+</details>
+

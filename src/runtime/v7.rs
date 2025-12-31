@@ -24,7 +24,7 @@ use crate::{
         cache::ResourceCache,
         kind::ReadWrite,
         matrix::Matrix,
-        ops::{Activation, TensorCommand, TensorOp},
+        ops::{Activation, TensorOp},
         serialization::Seed,
         shape::{Shape, TensorDimension},
         DeepClone, IntoPackedCursors, TensorCpu, TensorError, TensorGpu, TensorGpuView, TensorInit,
@@ -152,21 +152,32 @@ pub struct State {
 impl State {
     async fn back(&self, batch: usize) -> Result<TensorCpu<f32>, TensorError> {
         let context = &self.context;
-        let mut tensors = Vec::with_capacity(self.info.num_layer);
+        let head_size = self.info.num_emb / self.info.num_head;
+
+        // Create a single contiguous destination tensor for all layers
+        let destination: TensorGpu<f32, ReadWrite> =
+            context.tensor_init([self.info.num_emb, head_size + 2, self.info.num_layer, 1]);
+
+        // Copy all layer batches in one encoder pass
         let mut encoder = context.device.create_command_encoder(&Default::default());
-        for data in self.data.iter() {
-            let shape = data.shape();
-            let destination = context.tensor_init([shape[0], shape[1], 1, 1]);
-            encoder.copy_tensor_batch(data, &destination, batch, 0)?;
-            tensors.push(destination);
+        for (layer, data) in self.data.iter().enumerate() {
+            let layer_size =
+                (std::mem::size_of::<f32>() * self.info.num_emb * (head_size + 2)) as u64;
+            let src_offset =
+                (std::mem::size_of::<f32>() * data.shape()[0] * data.shape()[1] * batch) as u64;
+            let dst_offset = layer_size * layer as u64;
+            encoder.copy_buffer_to_buffer(
+                &data.buffer,
+                src_offset,
+                &destination.buffer,
+                dst_offset,
+                layer_size,
+            );
         }
         context.queue.submit(Some(encoder.finish()));
 
-        let mut backed = Vec::with_capacity(tensors.len());
-        for tensor in tensors {
-            backed.push(tensor.back().await);
-        }
-        TensorCpu::stack(backed, 2)
+        // Single GPU→CPU transfer
+        Ok(destination.back().await)
     }
 }
 
@@ -690,8 +701,9 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
             let hooks = self.hooks.clone();
             let frame = frame.clone();
             let head = model.tensor.head.clone();
+            let embed_only = seed.is_embed_only();
 
-            let op = dispatch_header(hooks, frame, head, head_x, num_header, head_op)?;
+            let op = dispatch_header(hooks, frame, head, head_x, num_header, head_op, embed_only)?;
             ops.push(op);
         }
 
@@ -1013,6 +1025,7 @@ fn dispatch_header<F: Float>(
     head_x: TensorGpu<F, ReadWrite>,
     num_header: usize,
     head_op: TensorOp,
+    embed_only: bool,
 ) -> Result<TensorOp, TensorError> {
     let hook_op = |hook: Hook| hook_op(&hooks, &hook, &frame);
     let header = &frame.header;
@@ -1023,14 +1036,20 @@ fn dispatch_header<F: Float>(
             hook_op(Hook::PreHead)?,
             TensorOp::layer_norm(&head.ln.w, &head.ln.b, &head_x, Model::LN_EPS)?,
             hook_op(Hook::PostHeadLayerNorm)?,
-            head.w.matmul_op(
-                head_x.view(.., .., .., ..)?,
-                header.head_o.view(.., .., .., ..)?,
-                Activation::None,
-                turbo(num_header),
-            )?,
-            hook_op(Hook::PostHead)?,
         ]);
+
+        // Skip head projection when extracting embeddings only
+        if !embed_only {
+            ops.extend([
+                head.w.matmul_op(
+                    head_x.view(.., .., .., ..)?,
+                    header.head_o.view(.., .., .., ..)?,
+                    Activation::None,
+                    turbo(num_header),
+                )?,
+                hook_op(Hook::PostHead)?,
+            ]);
+        }
     }
     Ok(TensorOp::List(ops))
 }

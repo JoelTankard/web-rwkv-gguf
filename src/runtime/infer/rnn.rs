@@ -38,6 +38,17 @@ impl RnnInfo {
         self.0.len()
     }
 
+    /// Returns true if all batches with output want embeddings (skip head projection).
+    #[inline]
+    pub fn is_embed_only(&self) -> bool {
+        self.0.iter().all(|info| {
+            matches!(
+                info.option,
+                None | Some(RnnOption::EmbedLast) | Some(RnnOption::EmbedFull)
+            )
+        })
+    }
+
     pub fn redirect(&self) -> RnnRedirect {
         let mut headers = vec![];
         let mut inputs = vec![(0, 0); self.num_batch()];
@@ -52,7 +63,7 @@ impl RnnInfo {
                     outputs[batch] = (p_out, p_out);
                     p_in += len;
                 }
-                Some(RnnOption::Last) => {
+                Some(RnnOption::Last) | Some(RnnOption::EmbedLast) => {
                     inputs[batch] = (p_in, p_in + len);
                     match len {
                         0 => outputs[batch] = (p_out, p_out),
@@ -64,7 +75,7 @@ impl RnnInfo {
                     }
                     p_in += len;
                 }
-                Some(RnnOption::Full) => {
+                Some(RnnOption::Full) | Some(RnnOption::EmbedFull) => {
                     inputs[batch] = (p_in, p_in + len);
                     outputs[batch] = (p_out, p_out + len);
                     headers.append(&mut (p_in..p_in + len).collect());
@@ -141,6 +152,10 @@ pub enum RnnOption {
     Last,
     /// Output predictions for all tokens.
     Full,
+    /// Extract hidden state embeddings for the last token (skips head projection).
+    EmbedLast,
+    /// Extract hidden state embeddings for all tokens (skips head projection).
+    EmbedFull,
 }
 
 #[derive(Debug, Clone, Deref, DerefMut)]
@@ -327,6 +342,9 @@ impl Iterator for RnnIter {
                 (RnnOption::Last, 0) => Some(RnnOption::Last),
                 (RnnOption::Last, _) => None,
                 (RnnOption::Full, _) => Some(RnnOption::Full),
+                (RnnOption::EmbedLast, 0) => Some(RnnOption::EmbedLast),
+                (RnnOption::EmbedLast, _) => None,
+                (RnnOption::EmbedFull, _) => Some(RnnOption::EmbedFull),
             };
         }
 
