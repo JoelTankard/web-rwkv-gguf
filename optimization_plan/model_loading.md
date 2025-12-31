@@ -4,25 +4,33 @@
 
 | Backend           | Load Time | Technique                     |
 | ----------------- | --------- | ----------------------------- |
-| WebGPU (web-rwkv) | **~4.6s** | Rayon parallel dequantization |
+| WebGPU (web-rwkv) | **~5.0s** | Rayon parallel dequantization |
 | llama.cpp         | ~250ms    | Memory-mapped files (mmap)    |
 
 ### Optimizations Applied
 
 1. **Parallel dequantization with rayon** - Q4_K and Q6_K dequantization uses multiple CPU cores
 
-### Attempted but Reverted
+### Native Q4_K Loading Investigation
 
-1. **Native Q4_K/Q5_K/Q6_K loading** - Caused inference quality issues (NaN in output)
-2. **Head weight native Q6_K** - Also caused inference issues
+The native Q4_K/Q5_K/Q6_K loading path was investigated and **works correctly** (quality hash matches). However, it causes a **3x inference slowdown**:
+
+| Path          | Load Time | Generation | Trade-off          |
+| ------------- | --------- | ---------- | ------------------ |
+| F16 (current) | ~5.0s     | 40 tok/s   | Best for inference |
+| Native Q4_K   | ~3.3s     | 14 tok/s   | Best for loading   |
+
+The native Q4_K matmul shaders dequantize on-the-fly during each matmul, which is slower than pre-dequantized F16. For typical chat sessions generating 100+ tokens, the inference slowdown far outweighs the 1.7s load time savings.
+
+**Decision:** Keep F16 path for inference speed.
 
 ### Current Performance
 
 | Metric       | Value              |
 | ------------ | ------------------ |
-| Load Time    | ~4.6s              |
-| Prefill      | ~147 tok/s         |
-| Generation   | ~40.5 tok/s        |
+| Load Time    | ~5.0s              |
+| Prefill      | ~146 tok/s         |
+| Generation   | ~40 tok/s          |
 | Quality Hash | 3895ad4add71cff0 ✓ |
 
 ### Remaining Bottleneck

@@ -834,11 +834,6 @@ impl<R: Reader> Loader<R> {
                 // Create a dummy tensor with the logical matrix shape for metadata
                 let s: TensorGpu<u8, ReadWrite> = context.tensor_init(shape);
 
-                log::info!(
-                    "native Q4_K load: {name} ({} elements, {} bytes)",
-                    num_elements,
-                    raw_data.len()
-                );
                 Ok(Some(Matrix::Q4K { w, s }))
             }
             (GgmlType::Q5K, Quant::Int8) | (GgmlType::Q5K, Quant::None) => {

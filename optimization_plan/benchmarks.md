@@ -347,3 +347,122 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 
 </details>
 
+## Debug
+
+### 2025-12-31 06:30:34 - Debug Q4K loading
+
+| Metric | Value |
+|--------|-------|
+| Model | rwkv7-g1b-2.9b-20251205-ctx8192-Q4_K_M.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **3366.95 ms** |
+| **Prefill** | **132.24 tok/s** |
+| **Generation** | **14.29 tok/s** |
+| Quality Hash | `3895ad4add71cff0` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129]
+```
+
+</details>
+
+## Q4K Native Loading
+
+### 2025-12-31 06:31:14 - Native Q4K loading enabled
+
+| Metric | Value |
+|--------|-------|
+| Model | rwkv7-g1b-2.9b-20251205-ctx8192-Q4_K_M.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **3264.28 ms** |
+| **Prefill** | **132.08 tok/s** |
+| **Generation** | **14.29 tok/s** |
+| Quality Hash | `3895ad4add71cff0` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129]
+```
+
+</details>
+
+
+### 2025-12-31 06:32:26 - Native Q4K loading enabled
+
+| Metric | Value |
+|--------|-------|
+| Model | rwkv7-g1b-2.9b-20251205-ctx8192-Q4_K_M.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **3768.72 ms** |
+| **Prefill** | **117.35 tok/s** |
+| **Generation** | **14.32 tok/s** |
+| Quality Hash | `3895ad4add71cff0` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129]
+```
+
+</details>
+
+## F16 Path
+
+### 2025-12-31 06:34:09 - Reverted to F16 path for inference speed
+
+| Metric | Value |
+|--------|-------|
+| Model | rwkv7-g1b-2.9b-20251205-ctx8192-Q4_K_M.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **5013.57 ms** |
+| **Prefill** | **146.18 tok/s** |
+| **Generation** | **39.93 tok/s** |
+| Quality Hash | `3895ad4add71cff0` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129]
+```
+
+</details>
+
+## Final Verification
+
+### 2025-12-31 06:35:34 - F16 path with rayon parallelization
+
+| Metric | Value |
+|--------|-------|
+| Model | rwkv7-g1b-2.9b-20251205-ctx8192-Q4_K_M.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4999.59 ms** |
+| **Prefill** | **146.45 tok/s** |
+| **Generation** | **39.67 tok/s** |
+| Quality Hash | `3895ad4add71cff0` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129]
+```
+
+</details>
+
