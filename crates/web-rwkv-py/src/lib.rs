@@ -436,9 +436,25 @@ impl Model {
                 }
             };
 
-            num_token += output[0].0.shape()[1];
-            let mut output = output[0].0.clone().to_vec();
-            data.append(&mut output);
+            let batch_tokens = output[0].0.shape()[1];
+            num_token += batch_tokens;
+
+            // For embeddings, only take the first num_emb elements per token
+            let output_tensor = &output[0].0;
+            let is_embed = matches!(option, RnnOption::EmbedLast | RnnOption::EmbedFull);
+            if is_embed {
+                let num_emb = self.info.num_emb;
+                let full_data = output_tensor.clone().to_vec();
+                let num_vocab = output_tensor.shape()[0];
+                // Extract only num_emb elements per token from the num_vocab-sized output
+                for t in 0..batch_tokens {
+                    let start = t * num_vocab;
+                    data.extend_from_slice(&full_data[start..start + num_emb]);
+                }
+            } else {
+                let mut output_data = output_tensor.clone().to_vec();
+                data.append(&mut output_data);
+            }
             inference.replace(input);
         }
 
@@ -491,23 +507,41 @@ impl Model {
                 }
             };
 
+            let is_embed = matches!(option, RnnOption::EmbedLast | RnnOption::EmbedFull);
+            let num_emb = self.info.num_emb;
+
             for (i, batch_output) in output.0.iter().enumerate() {
                 let tokens_in_batch = batch_output.0.shape()[1];
                 if tokens_in_batch > 0 {
                     batch_tokens[i] += tokens_in_batch;
-                    let mut output_data = batch_output.0.clone().to_vec();
-                    batch_data[i].append(&mut output_data);
+
+                    if is_embed {
+                        let full_data = batch_output.0.clone().to_vec();
+                        let num_vocab = batch_output.0.shape()[0];
+                        // Extract only num_emb elements per token
+                        for t in 0..tokens_in_batch {
+                            let start = t * num_vocab;
+                            batch_data[i].extend_from_slice(&full_data[start..start + num_emb]);
+                        }
+                    } else {
+                        let mut output_data = batch_output.0.clone().to_vec();
+                        batch_data[i].append(&mut output_data);
+                    }
                 }
             }
             inference.replace(input);
         }
 
         let num_emb = self.info.num_emb;
+        let num_vocab = self.info.num_vocab;
+        let is_embed = matches!(option, RnnOption::EmbedLast | RnnOption::EmbedFull);
+        let output_dim = if is_embed { num_emb } else { num_vocab };
+
         let results: Result<Vec<_>> = batch_data
             .into_iter()
             .zip(batch_tokens.iter())
             .map(|(data, &num_token)| {
-                TensorCpu::from_data([num_emb, num_token, 1, 1], data)
+                TensorCpu::from_data([output_dim, num_token, 1, 1], data)
                     .map_err(|e| anyhow::anyhow!("{}", e))
             })
             .collect();

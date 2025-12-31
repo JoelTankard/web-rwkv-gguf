@@ -1039,7 +1039,16 @@ fn dispatch_header<F: Float>(
         ]);
 
         // Skip head projection when extracting embeddings only
-        if !embed_only {
+        if embed_only {
+            // Copy embeddings (head_x) to output (head_o) - they have different first dimensions
+            // head_x: [num_emb, num_header, 1, 1], head_o: [num_vocab, num_header, 1, 1]
+            // We blit to the first num_emb elements of head_o
+            let num_emb = head_x.shape()[0];
+            ops.push(TensorOp::blit(
+                head_x.view(.., .., .., ..)?,
+                header.head_o.view(..num_emb, .., .., ..)?,
+            )?);
+        } else {
             ops.extend([
                 head.w.matmul_op(
                     head_x.view(.., .., .., ..)?,
