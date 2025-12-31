@@ -41,6 +41,33 @@ cargo run --release --example chat -- --model /path/to/model.gguf
 cargo run --release --example chat -- --model /path/to/model.st
 ```
 
+## Benchmarking
+
+Track performance across code changes with the benchmark tool:
+
+```bash
+# Interactive mode (prompts for title and description)
+./benchmark.sh
+
+# With a specific output file
+./benchmark.sh -f quantization_speedup
+
+# Fully specified (no prompts)
+./benchmark.sh -t "Baseline" -c "Initial measurement" -f q4k_native
+
+# Custom model
+./benchmark.sh -m /path/to/model.gguf -t "Test" -c "Description"
+```
+
+Results are saved to `benchmarks/<file>.md` with metrics:
+
+-   **Load time** — Model loading duration
+-   **Prefill** — Tokens/second for prompt processing
+-   **Generation** — Tokens/second for autoregressive generation
+-   **Quality hash** — Deterministic output hash for regression detection
+
+Run `./benchmark.sh -h` for all options.
+
 ## Converting Models
 
 ### `.pth` to Q4_K_M GGUF (Recommended)

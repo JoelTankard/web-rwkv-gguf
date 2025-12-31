@@ -12,7 +12,7 @@
 //!     --model /path/to/model.gguf \
 //!     --title "Baseline" \
 //!     --change "Initial measurement before optimization" \
-//!     --output benchmarks.md
+//!     --file quantization_speedup
 
 use std::{
     collections::HashMap,
@@ -73,9 +73,9 @@ struct Args {
     #[arg(short, long)]
     change: String,
 
-    /// Output markdown file path
-    #[arg(short, long, default_value = "optimization_plan/benchmarks.md")]
-    output: PathBuf,
+    /// Output filename (without extension, will be placed in benchmarks/ folder)
+    #[arg(short, long, default_value = "benchmarks")]
+    file: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,8 +578,13 @@ async fn main() -> Result<()> {
 
     let result = run_benchmark(&args).await?;
 
+    // Construct output path: benchmarks/<file>.md
+    let benchmarks_dir = PathBuf::from("benchmarks");
+    std::fs::create_dir_all(&benchmarks_dir)?;
+    let output_path = benchmarks_dir.join(format!("{}.md", args.file));
+
     // Write to markdown
-    write_result_to_markdown(&result, &args.output)?;
+    write_result_to_markdown(&result, &output_path)?;
 
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║                         RESULTS                              ║");
@@ -602,7 +607,7 @@ async fn main() -> Result<()> {
     );
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
-    println!("📄 Results written to: {}", args.output.display());
+    println!("📄 Results written to: {}", output_path.display());
 
     Ok(())
 }
