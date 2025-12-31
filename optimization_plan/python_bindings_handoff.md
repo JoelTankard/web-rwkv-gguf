@@ -1,5 +1,13 @@
 # Python Bindings Optimization Handoff
 
+## UPDATE: Bindings Now in web-rwkv-gguf
+
+The Python bindings have been moved into the `web-rwkv-gguf` repo at `crates/web-rwkv-py/`.
+
+**To set up RWKV-email-agent to use the new bindings, see the prompt at the bottom of this file.**
+
+---
+
 ## Context
 
 The `web-rwkv-gguf` Rust library has been optimized with:
@@ -184,3 +192,115 @@ In `web-rwkv-gguf`:
 -   `examples/test_embed_api.rs` - Test demonstrating the new functionality
 
 The Rust library is ready. The Python bindings just need to expose these features and add zero-copy numpy support.
+
+---
+
+# RWKV-email-agent Setup Prompt
+
+Copy this prompt to the RWKV-email-agent repo to set up the new optimized Python bindings:
+
+---
+
+## Task: Switch to Optimized Python Bindings from web-rwkv-gguf
+
+The Python bindings have been moved into the `web-rwkv-gguf` repo with optimizations for state extraction and embedding. Update this project to use them.
+
+### Step 1: Update Cargo.toml
+
+Change the workspace to point to the new bindings location:
+
+```toml
+[workspace]
+members = ["benchmark_tui/web-rwkv-py"]  # REMOVE THIS LINE
+exclude = ["web-rwkv", "web-rwkv-gguf", "legacy_app"]
+resolver = "2"
+```
+
+Replace with:
+
+```toml
+[workspace]
+resolver = "2"
+# Python bindings are now built from web-rwkv-gguf/crates/web-rwkv-py
+```
+
+### Step 2: Build the New Bindings
+
+```bash
+cd /Users/joel/Dev/Experimental/web-rwkv-gguf/crates/web-rwkv-py
+pip install maturin
+maturin develop --release
+```
+
+### Step 3: Update benchmark_tui/dashboard.py
+
+Replace slow `to_list()` calls with optimized `to_numpy()` or `embed()`:
+
+**Line ~919 (Doc State):**
+
+```python
+# Before:
+final_doc_state = np.array(self._runner.back_state().to_list(), dtype=np.float32)
+
+# After:
+final_doc_state = self._runner.back_state_numpy()
+```
+
+**Line ~937 (Field Analysis loop):**
+
+```python
+# Before:
+query_emb = np.array(self._runner.back_state().to_list(), dtype=np.float32)
+
+# After:
+query_emb = self._runner.back_state_numpy()
+```
+
+### Step 4: Update benchmark_tui/model.py
+
+The `RWKVCompletionRunner` class wraps the bindings. Add convenience methods:
+
+```python
+def back_state_numpy(self):
+    """Get state as numpy array directly (faster than back_state().to_list())"""
+    return self._model.back_state_numpy()
+
+def embed(self, tokens: list[int], token_chunk_size: int = 128) -> np.ndarray:
+    """Get embeddings without running head projection (faster for similarity)"""
+    tokens_u16 = [t if t < 65536 else 0 for t in tokens]
+    return self._model.embed(tokens_u16, token_chunk_size=token_chunk_size)
+```
+
+### Step 5: (Optional) Use embed() for Field Analysis
+
+For even faster field analysis, use `embed()` which skips the head projection entirely:
+
+```python
+# In _do_extraction, replace the field analysis loop:
+for field_name, field_description in schema.items():
+    field_query = f"{field_name}: {field_description}"
+    field_query_tokens = self._runner.tokenize(field_query)
+
+    self._runner.reset_state()
+    # Use embed() instead of run() + back_state()
+    query_emb = self._runner.embed(field_query_tokens)
+    # ... rest of similarity calculation
+```
+
+### Expected Results
+
+| Metric         | Before | After  | Improvement |
+| -------------- | ------ | ------ | ----------- |
+| Doc State      | 938ms  | ~200ms | 4.7x faster |
+| Field Analysis | 1.83s  | ~400ms | 4.6x faster |
+
+### New APIs Available
+
+-   `model.back_state_numpy()` - Returns state as numpy array directly
+-   `model.embed(tokens, last_only=True)` - Get embeddings, skips head projection
+-   `state.to_numpy()` - Convert state to numpy (if you have a State object)
+-   `PyRnnOption.EmbedLast` / `PyRnnOption.EmbedFull` - For explicit control
+
+### Cleanup
+
+You can remove the old `benchmark_tui/web-rwkv-py/` directory since the bindings are now in `web-rwkv-gguf/crates/web-rwkv-py/`.
