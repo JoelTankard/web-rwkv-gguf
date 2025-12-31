@@ -23,6 +23,7 @@ use crate::{
     tensor::{
         cache::ResourceCache,
         kind::ReadWrite,
+        lazy::LazyMatrix,
         matrix::Matrix,
         ops::{Activation, TensorCommand, TensorOp},
         serialization::Seed,
@@ -32,8 +33,7 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone, Serialize, DeserializeSeed)]
-#[serde_seed(seed = "Seed", context = "Context")]
+#[derive(Debug, Clone)]
 pub struct Model {
     pub context: Context,
     pub info: ModelInfo,
@@ -59,8 +59,7 @@ pub struct CustomInfo {
     pub v: usize,
 }
 
-#[derive(Debug, Clone, Serialize, DeserializeSeed)]
-#[serde_seed(seed = "Seed", context = "Context")]
+#[derive(Debug, Clone)]
 pub struct ModelTensor {
     pub embed: Embed,
     pub head: Head,
@@ -74,8 +73,7 @@ pub struct LayerNorm {
     pub b: TensorGpu<f16, ReadWrite>,
 }
 
-#[derive(Debug, Clone, Serialize, DeserializeSeed)]
-#[serde_seed(seed = "Seed", context = "Context")]
+#[derive(Debug, Clone)]
 pub struct Att {
     pub x_r: TensorGpu<f16, ReadWrite>,
     pub x_w: TensorGpu<f16, ReadWrite>,
@@ -88,38 +86,38 @@ pub struct Att {
     pub a0: TensorGpu<f16, ReadWrite>,
     pub v0: TensorGpu<f16, ReadWrite>,
 
-    pub w1: Matrix,
-    pub w2: Matrix,
-    pub a1: Matrix,
-    pub a2: Matrix,
-    pub g1: Matrix,
-    pub g2: Matrix,
-    pub v1: Matrix,
-    pub v2: Matrix,
+    /// Weight matrices - use LazyMatrix for deferred GPU upload
+    pub w1: LazyMatrix,
+    pub w2: LazyMatrix,
+    pub a1: LazyMatrix,
+    pub a2: LazyMatrix,
+    pub g1: LazyMatrix,
+    pub g2: LazyMatrix,
+    pub v1: LazyMatrix,
+    pub v2: LazyMatrix,
 
     pub r_k: TensorGpu<f16, ReadWrite>,
     pub k_k: TensorGpu<f16, ReadWrite>,
     pub k_a: TensorGpu<f16, ReadWrite>,
 
-    pub w_k: Matrix,
-    pub w_v: Matrix,
-    pub w_r: Matrix,
-    pub w_o: Matrix,
+    pub w_k: LazyMatrix,
+    pub w_v: LazyMatrix,
+    pub w_r: LazyMatrix,
+    pub w_o: LazyMatrix,
 
     pub gn: LayerNorm,
 }
 
-#[derive(Debug, Clone, Serialize, DeserializeSeed)]
-#[serde_seed(seed = "Seed", context = "Context")]
+#[derive(Debug, Clone)]
 pub struct Ffn {
     pub x_k: TensorGpu<f16, ReadWrite>,
 
-    pub w_k: Matrix,
-    pub w_v: Matrix,
+    /// Large weight matrices - use LazyMatrix for deferred GPU upload
+    pub w_k: LazyMatrix,
+    pub w_v: LazyMatrix,
 }
 
-#[derive(Debug, Clone, Serialize, DeserializeSeed)]
-#[serde_seed(seed = "Seed", context = "Context")]
+#[derive(Debug, Clone)]
 pub struct Layer {
     pub att_ln: LayerNorm,
     pub ffn_ln: LayerNorm,
@@ -134,11 +132,11 @@ pub struct Embed {
     pub w: TensorCpu<f16>,
 }
 
-#[derive(Debug, Clone, Serialize, DeserializeSeed)]
-#[serde_seed(seed = "Seed", context = "Context")]
+#[derive(Debug, Clone)]
 pub struct Head {
     pub ln: LayerNorm,
-    pub w: Matrix,
+    /// Large weight matrix - use LazyMatrix for deferred GPU upload
+    pub w: LazyMatrix,
 }
 
 #[derive(Debug, Clone, Serialize, DeserializeSeed)]
@@ -572,11 +570,6 @@ impl<F: Float> super::model::Bundle for Bundle<F> {
     #[inline]
     fn state(&self) -> impl super::model::State + AsAny + 'static {
         self.state.clone()
-    }
-
-    #[inline]
-    fn model(&self) -> impl Serialize + 'static {
-        self.model.clone()
     }
 }
 
@@ -1044,7 +1037,7 @@ impl<R: Reader> ModelBuilder<R> {
             sep,
             lora,
             quant,
-            ..
+            shared_mmap,
         } = self;
 
         let rescale = rescale.unwrap_or(Model::DEFAULT_RESCALE);
@@ -1070,7 +1063,18 @@ impl<R: Reader> ModelBuilder<R> {
                 w: loader.load_vector_f16("ln_out.weight")?,
                 b: loader.load_vector_f16("ln_out.bias")?,
             },
-            w: Matrix::Fp16(loader.load_matrix_f16_padded("head.weight")?),
+            w: {
+                // Load head.weight lazily - it's 65536x2560 = 168M elements
+                if let Some(ref mmap) = shared_mmap {
+                    loader.load_matrix_lazy_zero_copy(
+                        "head.weight".to_string(),
+                        Quant::None,
+                        mmap,
+                    )?
+                } else {
+                    LazyMatrix::loaded(Matrix::Fp16(loader.load_matrix_f16_padded("head.weight")?))
+                }
+            },
         };
 
         let submission_index = Some(context.queue.submit(None));
@@ -1079,9 +1083,32 @@ impl<R: Reader> ModelBuilder<R> {
             timeout: None,
         });
 
-        let load_matrix = |name: String, quant: Quant| loader.load_matrix(name, quant);
-        let load_matrix_discount = |name: String, quant: Quant, discount: f32| {
-            loader.load_matrix_discount(name, quant, discount)
+        // Use zero-copy lazy loading - returns LazyMatrix for deferred GPU upload
+        let load_matrix_lazy = |name: String, quant: Quant| -> Result<LazyMatrix, LoaderError> {
+            if let Some(ref mmap) = shared_mmap {
+                // True zero-copy lazy loading - GPU upload deferred until first use
+                loader.load_matrix_lazy_zero_copy(name, quant, mmap)
+            } else {
+                // Fall back to eager loading wrapped in LazyMatrix
+                loader.load_matrix(name, quant).map(LazyMatrix::loaded)
+            }
+        };
+        let load_matrix_lazy_discount =
+            |name: String, quant: Quant, discount: f32| -> Result<LazyMatrix, LoaderError> {
+                // Discount matrices still use eager loading (wrapped in LazyMatrix)
+                loader
+                    .load_matrix_discount(name, quant, discount)
+                    .map(LazyMatrix::loaded)
+            };
+        // Load Fp16 matrices lazily using zero-copy when available
+        let load_matrix_f16_lazy = |name: String| -> Result<LazyMatrix, LoaderError> {
+            if let Some(ref mmap) = shared_mmap {
+                loader.load_matrix_lazy_zero_copy(name, Quant::None, mmap)
+            } else {
+                loader
+                    .load_matrix_f16(name)
+                    .map(|t| LazyMatrix::loaded(Matrix::Fp16(t)))
+            }
         };
 
         let mut layers = vec![];
@@ -1105,19 +1132,19 @@ impl<R: Reader> ModelBuilder<R> {
             let w0 = loader.load_vector_f16(format!("{att}.w0"))?;
             let a0 = loader.load_vector_f16(format!("{att}.a0"))?;
 
-            let w1 = Matrix::Fp16(loader.load_matrix_f16(format!("{att}.w1"))?);
-            let w2 = Matrix::Fp16(loader.load_matrix_f16(format!("{att}.w2"))?);
-            let a1 = Matrix::Fp16(loader.load_matrix_f16(format!("{att}.a1"))?);
-            let a2 = Matrix::Fp16(loader.load_matrix_f16(format!("{att}.a2"))?);
-            let g1 = Matrix::Fp16(loader.load_matrix_f16(format!("{att}.g1"))?);
-            let g2 = Matrix::Fp16(loader.load_matrix_f16(format!("{att}.g2"))?);
+            let w1 = load_matrix_f16_lazy(format!("{att}.w1"))?;
+            let w2 = load_matrix_f16_lazy(format!("{att}.w2"))?;
+            let a1 = load_matrix_f16_lazy(format!("{att}.a1"))?;
+            let a2 = load_matrix_f16_lazy(format!("{att}.a2"))?;
+            let g1 = load_matrix_f16_lazy(format!("{att}.g1"))?;
+            let g2 = load_matrix_f16_lazy(format!("{att}.g2"))?;
 
             let (v0, v1, v2) = match layer {
                 0 => (a0.clone(), a1.clone(), a2.clone()), // placeholder, actually not used
                 _ => (
                     loader.load_vector_f16(format!("{att}.v0"))?,
-                    Matrix::Fp16(loader.load_matrix_f16(format!("{att}.v1"))?),
-                    Matrix::Fp16(loader.load_matrix_f16(format!("{att}.v2"))?),
+                    load_matrix_f16_lazy(format!("{att}.v1"))?,
+                    load_matrix_f16_lazy(format!("{att}.v2"))?,
                 ),
             };
 
@@ -1165,10 +1192,10 @@ impl<R: Reader> ModelBuilder<R> {
                 r_k,
                 k_k,
                 k_a,
-                w_k: load_matrix(format!("{att}.key.weight"), quant)?,
-                w_v: load_matrix(format!("{att}.value.weight"), quant)?,
-                w_r: load_matrix(format!("{att}.receptance.weight"), quant)?,
-                w_o: load_matrix_discount(format!("{att}.output.weight"), quant, discount)?,
+                w_k: load_matrix_lazy(format!("{att}.key.weight"), quant)?,
+                w_v: load_matrix_lazy(format!("{att}.value.weight"), quant)?,
+                w_r: load_matrix_lazy(format!("{att}.receptance.weight"), quant)?,
+                w_o: load_matrix_lazy_discount(format!("{att}.output.weight"), quant, discount)?,
                 gn,
             };
 
@@ -1182,8 +1209,8 @@ impl<R: Reader> ModelBuilder<R> {
 
             let ffn = Ffn {
                 x_k,
-                w_k: load_matrix(format!("{ffn}.key.weight"), quant)?,
-                w_v: load_matrix_discount(format!("{ffn}.value.weight"), quant, discount)?,
+                w_k: load_matrix_lazy(format!("{ffn}.key.weight"), quant)?,
+                w_v: load_matrix_lazy_discount(format!("{ffn}.value.weight"), quant, discount)?,
             };
 
             layers.push(Layer {

@@ -209,10 +209,15 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkResult> {
         // Re-open file for each run to avoid caching effects
         let file = TokioFile::open(&args.model).await?;
         let data = unsafe { Mmap::map(&file)? };
-        let model = GgufReader::new(&data)?;
+
+        // Wrap mmap in Arc for zero-copy lazy loading
+        let arc_mmap: std::sync::Arc<Mmap> = std::sync::Arc::new(data);
+        let model = GgufReader::new(&arc_mmap)?;
 
         let start = Instant::now();
-        let builder = ModelBuilder::new(&context, model).quant(HashMap::new());
+        let builder = ModelBuilder::new(&context, model)
+            .quant(HashMap::new())
+            .shared_mmap(arc_mmap.clone());
         let _runtime: Box<dyn Runtime<Rnn>> = match info.version {
             ModelVersion::V4 => {
                 let model = builder.build_v4().await?;
@@ -250,8 +255,11 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkResult> {
     // Create runtime for inference benchmarks
     let file = TokioFile::open(&args.model).await?;
     let data = unsafe { Mmap::map(&file)? };
-    let model = GgufReader::new(&data)?;
-    let builder = ModelBuilder::new(&context, model).quant(HashMap::new());
+    let arc_mmap: std::sync::Arc<Mmap> = std::sync::Arc::new(data);
+    let model = GgufReader::new(&arc_mmap)?;
+    let builder = ModelBuilder::new(&context, model)
+        .quant(HashMap::new())
+        .shared_mmap(arc_mmap.clone());
 
     let runtime: Box<dyn Runtime<Rnn>> = match info.version {
         ModelVersion::V4 => {

@@ -13,6 +13,7 @@ use crate::{
     num::Scalar,
     tensor::{
         kind::ReadWrite,
+        lazy::{LazyMatrix, SharedBytes},
         matrix::Matrix,
         ops::{Activation, TensorOp},
         shape::{Shape, TensorDimension},
@@ -50,6 +51,12 @@ pub trait Reader {
     /// Get raw quantized tensor data for direct loading (bypasses dequantization).
     /// Returns (ggml_type_id, raw_data) if the tensor is quantized, None otherwise.
     fn quantized_tensor(&self, _name: &str) -> Option<(u32, &[u8])> {
+        None
+    }
+
+    /// Get raw tensor data for any tensor type including Fp16.
+    /// Returns (ggml_type_id, raw_data) for zero-copy lazy loading.
+    fn raw_tensor(&self, _name: &str) -> Option<(u32, &[u8])> {
         None
     }
 }
@@ -948,5 +955,119 @@ impl<R: Reader> Loader<R> {
                 Ok(Matrix::quant_sf4(&buffer, 5.0)?)
             }
         }
+    }
+
+    /// Load a matrix lazily with zero-copy from shared mmap data.
+    /// Returns a LazyMatrix that will upload to GPU on first use.
+    pub fn load_matrix_lazy_zero_copy(
+        &self,
+        name: String,
+        quant: Quant,
+        shared_data: &SharedBytes,
+    ) -> Result<LazyMatrix, LoaderError> {
+        use super::gguf::GgmlType;
+        let context = &self.context;
+
+        if let Some((gguf_type, raw_data)) = self.model.quantized_tensor(&name) {
+            let shape = self.tensor_shape(&name)?;
+            let num_elements = shape.len();
+            let data_len = raw_data.len();
+
+            // Calculate offset within the shared data by pointer arithmetic
+            let raw_data_ptr = raw_data.as_ptr() as usize;
+            let shared_slice: &[u8] = (**shared_data).as_ref();
+            let shared_ptr = shared_slice.as_ptr() as usize;
+
+            // Verify the raw_data points into the shared_data
+            if raw_data_ptr < shared_ptr || raw_data_ptr >= shared_ptr + shared_slice.len() {
+                // Pointers don't match - fall back to eager loading
+                let matrix = self.load_matrix(name, quant)?;
+                return Ok(LazyMatrix::loaded(matrix));
+            }
+            let offset = raw_data_ptr - shared_ptr;
+
+            match (GgmlType::from(gguf_type), quant) {
+                (GgmlType::Q4K, Quant::Int8) | (GgmlType::Q4K, Quant::None) => {
+                    let actual_elements = (data_len / 144) * 256;
+                    if actual_elements == num_elements && num_elements % 256 == 0 {
+                        return Ok(LazyMatrix::q4k_zero_copy(
+                            context.clone(),
+                            shared_data.clone(),
+                            offset,
+                            data_len,
+                            shape,
+                        ));
+                    }
+                }
+                (GgmlType::Q5K, Quant::Int8) | (GgmlType::Q5K, Quant::None) => {
+                    let actual_elements = (data_len / 176) * 256;
+                    if actual_elements == num_elements && num_elements % 256 == 0 {
+                        return Ok(LazyMatrix::q5k_zero_copy(
+                            context.clone(),
+                            shared_data.clone(),
+                            offset,
+                            data_len,
+                            shape,
+                        ));
+                    }
+                }
+                (GgmlType::Q6K, Quant::Int8) | (GgmlType::Q6K, Quant::None) => {
+                    let actual_elements = (data_len / 210) * 256;
+                    if actual_elements == num_elements && num_elements % 256 == 0 {
+                        return Ok(LazyMatrix::q6k_zero_copy(
+                            context.clone(),
+                            shared_data.clone(),
+                            offset,
+                            data_len,
+                            shape,
+                        ));
+                    }
+                }
+                (GgmlType::Q8_0, Quant::Int8) | (GgmlType::Q8_0, Quant::None) => {
+                    let actual_elements = (data_len / 34) * 32;
+                    if actual_elements == num_elements && num_elements % 32 == 0 {
+                        return Ok(LazyMatrix::q8_0_zero_copy(
+                            context.clone(),
+                            shared_data.clone(),
+                            offset,
+                            data_len,
+                            shape,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Try Fp16 zero-copy using raw_tensor
+        if let Some((gguf_type, raw_data)) = self.model.raw_tensor(&name) {
+            let shape = self.tensor_shape(&name)?;
+            let data_len = raw_data.len();
+
+            // Calculate offset within the shared data by pointer arithmetic
+            let raw_data_ptr = raw_data.as_ptr() as usize;
+            let shared_slice: &[u8] = (**shared_data).as_ref();
+            let shared_ptr = shared_slice.as_ptr() as usize;
+
+            // Verify the raw_data points into the shared_data
+            if raw_data_ptr >= shared_ptr && raw_data_ptr < shared_ptr + shared_slice.len() {
+                let offset = raw_data_ptr - shared_ptr;
+
+                // Check if it's Fp16 (GgmlType::F16 = 1)
+                if GgmlType::from(gguf_type) == GgmlType::F16 {
+                    return Ok(LazyMatrix::fp16_zero_copy(
+                        context.clone(),
+                        shared_data.clone(),
+                        offset,
+                        data_len,
+                        shape,
+                    ));
+                }
+            }
+        }
+
+        // Fall back to eager loading for unsupported formats
+        let matrix = self.load_matrix(name, quant)?;
+        Ok(LazyMatrix::loaded(matrix))
     }
 }

@@ -111,12 +111,6 @@ pub trait Bundle {
     #[cfg(target_arch = "wasm32")]
     /// Get the state from the bundle.
     fn state(&self) -> impl State + AsAny + 'static;
-    #[cfg(not(target_arch = "wasm32"))]
-    /// Get the model from the bundle.
-    fn model(&self) -> impl Serialize + Send + Sync + 'static;
-    #[cfg(target_arch = "wasm32")]
-    /// Get the model from the bundle.
-    fn model(&self) -> impl Serialize + 'static;
 }
 
 /// Quantization of a layer.
@@ -141,6 +135,8 @@ pub struct ModelBuilder<R: Reader> {
     pub sep: Option<usize>,
     pub lora: Vec<Lora<R>>,
     pub quant: HashMap<usize, Quant>,
+    /// Shared mmap data for zero-copy lazy loading.
+    pub shared_mmap: Option<crate::tensor::lazy::SharedBytes>,
 }
 
 impl<R: Reader> ModelBuilder<R> {
@@ -152,6 +148,7 @@ impl<R: Reader> ModelBuilder<R> {
             sep: None,
             lora: vec![],
             quant: Default::default(),
+            shared_mmap: None,
         }
     }
 
@@ -180,6 +177,12 @@ impl<R: Reader> ModelBuilder<R> {
 
     pub fn quant(mut self, value: HashMap<usize, Quant>) -> Self {
         self.quant = value;
+        self
+    }
+
+    /// Set shared mmap data for zero-copy lazy loading.
+    pub fn shared_mmap(mut self, data: crate::tensor::lazy::SharedBytes) -> Self {
+        self.shared_mmap = Some(data);
         self
     }
 }

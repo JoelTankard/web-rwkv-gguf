@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use half::f16;
 use safetensors::{Dtype, SafeTensorError};
@@ -1157,6 +1157,18 @@ pub struct GgufReader<'a> {
     name_map: HashMap<String, String>,
 }
 
+/// An owned version of GgufReader that holds data via Arc for zero-copy lazy loading.
+/// The Arc allows sharing the mmap data with LazyMatrix without copying.
+pub struct ArcGgufReader {
+    data: Arc<[u8]>,
+    pub version: u32,
+    pub tensor_count: u64,
+    pub metadata: HashMap<String, MetadataValue>,
+    pub tensors: HashMap<String, TensorInfo>,
+    pub tensor_data_offset: u64,
+    name_map: HashMap<String, String>,
+}
+
 fn build_rwkv_name_map(tensors: &HashMap<String, TensorInfo>) -> HashMap<String, String> {
     let mut map = HashMap::new();
 
@@ -1409,6 +1421,74 @@ impl<'a> GgufReader<'a> {
 
     pub fn get_metadata(&self, key: &str) -> Option<&MetadataValue> {
         self.metadata.get(key)
+    }
+}
+
+impl ArcGgufReader {
+    /// Create an ArcGgufReader from Arc-wrapped data (e.g., from mmap).
+    /// This enables zero-copy lazy loading by sharing the Arc with LazyMatrix.
+    pub fn new(data: Arc<[u8]>) -> Result<Self, GgufError> {
+        // Parse metadata using borrowed reader, then transfer ownership
+        let (version, tensor_count, metadata, tensors, tensor_data_offset, name_map) = {
+            let borrowed = GgufReader::new(&data)?;
+            (
+                borrowed.version,
+                borrowed.tensor_count,
+                borrowed.metadata,
+                borrowed.tensors,
+                borrowed.tensor_data_offset,
+                borrowed.name_map,
+            )
+        };
+
+        Ok(Self {
+            data,
+            version,
+            tensor_count,
+            metadata,
+            tensors,
+            tensor_data_offset,
+            name_map,
+        })
+    }
+
+    /// Get the shared Arc data reference - this is the key for zero-copy.
+    pub fn shared_data(&self) -> &Arc<[u8]> {
+        &self.data
+    }
+
+    /// Get tensor slice info for zero-copy lazy loading.
+    /// Returns (shared_arc, offset, length) so LazyMatrix can reference without copying.
+    pub fn get_tensor_slice_info(&self, name: &str) -> Option<(Arc<[u8]>, usize, usize)> {
+        let gguf_name = self.name_map.get(name)?;
+        let info = self.tensors.get(gguf_name)?;
+        let start = (self.tensor_data_offset + info.offset) as usize;
+        let len = info.data_size();
+        Some((self.data.clone(), start, len))
+    }
+
+    /// Get tensor type and raw data slice for zero-copy lazy loading.
+    /// Returns (tensor_type, raw_data_slice) for any tensor type including Fp16.
+    pub fn get_tensor_type_and_data(&self, name: &str) -> Option<(GgmlType, &[u8])> {
+        let gguf_name = self.name_map.get(name)?;
+        let info = self.tensors.get(gguf_name)?;
+        let start = (self.tensor_data_offset + info.offset) as usize;
+        let end = start + info.data_size();
+        Some((info.tensor_type, &self.data[start..end]))
+    }
+
+    pub fn get_tensor_data(&self, info: &TensorInfo) -> &[u8] {
+        let start = (self.tensor_data_offset + info.offset) as usize;
+        let end = start + info.data_size();
+        &self.data[start..end]
+    }
+
+    pub fn get_metadata(&self, key: &str) -> Option<&MetadataValue> {
+        self.metadata.get(key)
+    }
+
+    fn resolve_name(&self, name: &str) -> Option<&str> {
+        self.name_map.get(name).map(|s| s.as_str())
     }
 }
 
@@ -1791,6 +1871,18 @@ impl<'a> super::loader::Reader for GgufReader<'a> {
             }
             _ => None,
         }
+    }
+
+    fn raw_tensor(&self, name: &str) -> Option<(u32, &[u8])> {
+        // Don't support direct loading for virtual/sliced tensors
+        if self.try_get_fused_slice(name).is_some() {
+            return None;
+        }
+
+        let gguf_name = self.resolve_name(name)?;
+        let info = self.tensors.get(gguf_name)?;
+        let data = self.get_tensor_data(info);
+        Some((info.tensor_type.to_u32(), data))
     }
 }
 

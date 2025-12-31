@@ -434,11 +434,6 @@ impl<F: Float> super::model::Bundle for Bundle<F> {
     fn state(&self) -> impl super::model::State + AsAny + 'static {
         self.state.clone()
     }
-
-    #[inline]
-    fn model(&self) -> impl Serialize + 'static {
-        self.model.clone()
-    }
 }
 
 impl<F: Float> Bundle<F> {

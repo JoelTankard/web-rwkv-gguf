@@ -516,10 +516,6 @@ impl<F: Float> super::model::Bundle for Bundle<F> {
     fn state(&self) -> impl super::model::State + AsAny + 'static {
         self.state.clone()
     }
-
-    fn model(&self) -> impl Serialize + 'static {
-        self.model.clone()
-    }
 }
 
 fn turbo(num_token: usize) -> bool {
