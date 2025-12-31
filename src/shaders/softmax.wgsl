@@ -86,7 +86,9 @@ fn softmax(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
     var _sum = vec4<f32>(0.0);
     for (var i = index; i < stride; i += BLOCK_SIZE) {
         let value = load_x(bb + i);
-        _sum += exp(value - maximum);
+        let e = exp(value - maximum);
+        store_x(bb + i, e);
+        _sum += e;
     }
     sketch[index] = _sum;
     workgroupBarrier();
@@ -105,7 +107,6 @@ fn softmax(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
     workgroupBarrier();
 
     for (var i = index; i < stride; i += BLOCK_SIZE) {
-        let value = load_x(bb + i);
-        store_x(bb + i, exp(value - maximum) / sum);
+        store_x(bb + i, load_x(bb + i) / sum);
     }
 }

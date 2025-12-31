@@ -245,15 +245,6 @@ fn time_first(in: Input) {
         workgroupBarrier();
     }
 
-    // if in.tid.x == h {
-    //     var xx: vec4<f32>;
-    //     for (var j = 0u; j < HEAD_SIZE; j += 1u) {
-    //         xx += shared_x[h + j];
-    //     }
-    //     shared_x[h] = xx;
-    // }
-    // workgroupBarrier();
-
     if index < stride {
         let xx = dot(shared_x[h], vec4<f32>(1.0));
         let vv = load_v(ti);

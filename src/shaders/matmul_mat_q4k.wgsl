@@ -65,18 +65,24 @@ fn get_scale_byte(scales_u32: array<u32, 3>, byte_idx: u32) -> u32 {
 }
 
 fn get_scale_min_k4(j: u32, scales_u32: array<u32, 3>) -> vec2<f32> {
-    var sc: u32;
-    var m: u32;
-    if j < 4u {
-        sc = get_scale_byte(scales_u32, j) & 63u;
-        m = get_scale_byte(scales_u32, j + 4u) & 63u;
-    } else {
-        let b1 = get_scale_byte(scales_u32, j + 4u);
-        let b2 = get_scale_byte(scales_u32, j - 4u);
-        let b3 = get_scale_byte(scales_u32, j);
-        sc = (b1 & 0xFu) | ((b2 >> 6u) << 4u);
-        m = (b1 >> 4u) | ((b3 >> 6u) << 4u);
-    }
+    // Branchless: compute both paths and select
+    let b_j = get_scale_byte(scales_u32, j);
+    let b_j4 = get_scale_byte(scales_u32, j + 4u);
+    
+    // Path for j < 4: sc = b_j & 63, m = b_j4 & 63
+    let sc_lo = b_j & 63u;
+    let m_lo = b_j4 & 63u;
+    
+    // Path for j >= 4: need j-4 byte as well
+    // Use saturating subtract to avoid underflow when j < 4
+    let j_minus_4 = select(0u, j - 4u, j >= 4u);
+    let b_jm4 = get_scale_byte(scales_u32, j_minus_4);
+    let sc_hi = (b_j4 & 0xFu) | ((b_jm4 >> 6u) << 4u);
+    let m_hi = (b_j4 >> 4u) | ((b_j >> 6u) << 4u);
+    
+    let is_lo = j < 4u;
+    let sc = select(sc_hi, sc_lo, is_lo);
+    let m = select(m_hi, m_lo, is_lo);
     return vec2<f32>(f32(sc), f32(m));
 }
 
