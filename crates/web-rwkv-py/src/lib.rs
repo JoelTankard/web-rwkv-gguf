@@ -442,8 +442,12 @@ impl Model {
             inference.replace(input);
         }
 
-        let num_vocab = self.info.num_vocab;
-        let tensor = TensorCpu::from_data([num_vocab, num_token, 1, 1], data)?;
+        // For embeddings (EmbedLast/EmbedFull), output is num_emb; for logits, it's num_vocab
+        let output_dim = match option {
+            RnnOption::EmbedLast | RnnOption::EmbedFull => self.info.num_emb,
+            _ => self.info.num_vocab,
+        };
+        let tensor = TensorCpu::from_data([output_dim, num_token, 1, 1], data)?;
         Ok(tensor)
     }
 
