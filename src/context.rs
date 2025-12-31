@@ -104,9 +104,15 @@ pub enum ContextError {
 
 impl ContextBuilder {
     pub fn new(adapter: Adapter) -> Self {
-        let features = Features::empty();
+        let mut features = Features::empty();
         #[cfg(feature = "subgroup-ops")]
-        let features = features | Features::SUBGROUP;
+        {
+            features |= Features::SUBGROUP;
+        }
+        // Request SHADER_F16 if the adapter supports it (for ~3x faster Q4_K inference)
+        if adapter.features().contains(Features::SHADER_F16) {
+            features |= Features::SHADER_F16;
+        }
         Self {
             adapter,
             features,
@@ -440,6 +446,11 @@ impl Context {
     #[cfg(feature = "subgroup-ops")]
     pub fn max_subgroup_size(&self) -> u32 {
         self.adapter.limits().max_subgroup_size
+    }
+
+    /// Check if the device supports SHADER_F16 for faster f16 arithmetic in shaders.
+    pub fn supports_shader_f16(&self) -> bool {
+        self.device.features().contains(Features::SHADER_F16)
     }
 }
 

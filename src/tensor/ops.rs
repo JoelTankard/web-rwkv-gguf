@@ -223,6 +223,14 @@ impl Macros {
         }
     }
 
+    /// Enable SHADER_F16 for f16 arithmetic in shaders.
+    pub fn shader_f16(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.insert("SHADER_F16".into(), Default::default());
+        }
+        self
+    }
+
     pub fn activate(mut self, name: impl Into<String>, value: Activation) -> Self {
         const ACTIVATION_DEFINE: &str = "
 fn squared_relu(x: vec4<f32>) -> vec4<f32> {
@@ -1273,45 +1281,58 @@ impl TensorOp {
             output.shape()
         };
 
+        // Use f16 arithmetic when SHADER_F16 is available for ~3x speedup
+        let use_f16 = context.supports_shader_f16();
+
         #[cfg(not(feature = "subgroup-ops"))]
         let key = PipelineKey::new(
-            "matmul_vec_q4k",
+            if use_f16 {
+                "matmul_vec_q4k_f16"
+            } else {
+                "matmul_vec_q4k"
+            },
             "matmul",
             Macros::new()
                 .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .shader_f16(use_f16)
                 .tensor(&input, Some("IN"))
                 .tensor(&output, Some("OUT"))
                 .activate("ACT", act),
         );
         #[cfg(feature = "subgroup-ops")]
         let key = PipelineKey::new(
-            "matmul_vec_q4k",
+            if use_f16 {
+                "matmul_vec_q4k_f16"
+            } else {
+                "matmul_vec_q4k"
+            },
             "matmul",
             Macros::new()
                 .subgroup(context.min_subgroup_size(), context.max_subgroup_size())
                 .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .shader_f16(use_f16)
                 .tensor(&input, Some("IN"))
                 .tensor(&output, Some("OUT"))
                 .activate("ACT", act),
         );
 
+        // Select shader based on f16 support and subgroup-ops feature
         #[cfg(not(feature = "subgroup-ops"))]
-        let pipeline = context.checkout_pipeline(
-            &key,
-            include_str!("../shaders/matmul_vec_q4k.wgsl"),
-            &[
-                matrix_shape.meta_layout(0),
-                input.meta_layout(1),
-                output.meta_layout(2),
-                matrix.layout(3, true),
-                input.layout(4, true),
-                output.layout(5, false),
-            ],
-        );
+        let shader_source = if use_f16 {
+            include_str!("../shaders/matmul_vec_q4k_f16.wgsl")
+        } else {
+            include_str!("../shaders/matmul_vec_q4k.wgsl")
+        };
         #[cfg(feature = "subgroup-ops")]
+        let shader_source = if use_f16 {
+            include_str!("../shaders/matmul_vec_q4k_f16.wgsl")
+        } else {
+            include_str!("../shaders/subgroup/matmul_vec_q4k.wgsl")
+        };
+
         let pipeline = context.checkout_pipeline(
             &key,
-            include_str!("../shaders/subgroup/matmul_vec_q4k.wgsl"),
+            shader_source,
             &[
                 matrix_shape.meta_layout(0),
                 input.meta_layout(1),
@@ -1372,18 +1393,33 @@ impl TensorOp {
             output.shape()
         };
 
+        // Use f16 arithmetic when SHADER_F16 is available for ~3x speedup
+        let use_f16 = context.supports_shader_f16();
+
         let key = PipelineKey::new(
-            "matmul_mat_q4k",
+            if use_f16 {
+                "matmul_mat_q4k_f16"
+            } else {
+                "matmul_mat_q4k"
+            },
             "matmul",
             Macros::new()
                 .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .shader_f16(use_f16)
                 .tensor(&input, Some("IN"))
                 .tensor(&output, Some("OUT"))
                 .activate("ACT", act),
         );
+
+        let shader_source = if use_f16 {
+            include_str!("../shaders/matmul_mat_q4k_f16.wgsl")
+        } else {
+            include_str!("../shaders/matmul_mat_q4k.wgsl")
+        };
+
         let pipeline = context.checkout_pipeline(
             &key,
-            include_str!("../shaders/matmul_mat_q4k.wgsl"),
+            shader_source,
             &[
                 matrix_shape.meta_layout(0),
                 input.meta_layout(1),
