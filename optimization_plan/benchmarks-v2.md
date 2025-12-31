@@ -140,3 +140,33 @@ The most impactful optimization is **increasing chunk size**:
 1. **Increase default chunk size** to 512+ for prefill operations
 2. **Consider Metal-specific optimizations** - current shaders are generic WGSL
 3. **Profile on other GPUs** - optimal BLOCK_SIZE may vary by hardware
+
+## Phase 2.5: Batch Embedding
+
+### Implementation
+
+Added `embed_batch()` API to Python bindings that processes multiple sequences in a single GPU pass.
+
+**Files modified:**
+
+-   `crates/web-rwkv-py/src/lib.rs` - Added `embed_batch()` and `run_batch_internal()`
+-   `examples/bench_batch_embed.rs` - Benchmark for batch vs sequential embedding
+
+### Results (3 sequences × 32 tokens each)
+
+| Method      | Time      | Throughput    | Speedup   |
+| ----------- | --------- | ------------- | --------- |
+| Sequential  | 865ms     | 111 tok/s     | 1.0x      |
+| **Batched** | **304ms** | **316 tok/s** | **2.85x** |
+
+### Impact on Field Analysis
+
+For 6-field analysis (the original use case):
+
+-   **Before:** 6 separate forward passes
+-   **After:** 1 batched forward pass
+-   **Expected improvement:** ~3x faster
+
+This directly addresses the plan target:
+
+> Field Analysis 327ms → ~100ms (3x improvement)

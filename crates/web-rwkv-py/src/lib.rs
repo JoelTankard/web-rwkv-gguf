@@ -375,6 +375,34 @@ impl Model {
             .map_err(err)?;
         Ok(output.to_vec().into_pyarray(py))
     }
+
+    /// Extract embeddings for multiple sequences in a single batched GPU pass.
+    /// This is significantly faster than calling embed() multiple times.
+    ///
+    /// Args:
+    ///     sequences: List of token sequences to embed
+    ///     token_chunk_size: Chunk size for processing (default 512 for better throughput)
+    ///
+    /// Returns:
+    ///     List of embedding vectors, one per input sequence
+    #[pyo3(signature = (sequences, token_chunk_size=512))]
+    pub fn embed_batch<'py>(
+        &self,
+        py: Python<'py>,
+        sequences: Vec<Vec<u16>>,
+        token_chunk_size: usize,
+    ) -> PyResult<Vec<Bound<'py, PyArray1<f32>>>> {
+        let model = self.clone();
+        let outputs = self
+            .tokio
+            .block_on(model.run_batch_internal(sequences, RnnOption::EmbedLast, token_chunk_size))
+            .map_err(err)?;
+
+        Ok(outputs
+            .into_iter()
+            .map(|t| t.to_vec().into_pyarray(py))
+            .collect())
+    }
 }
 
 impl Model {
@@ -417,6 +445,70 @@ impl Model {
         let num_vocab = self.info.num_vocab;
         let tensor = TensorCpu::from_data([num_vocab, num_token, 1, 1], data)?;
         Ok(tensor)
+    }
+
+    async fn run_batch_internal(
+        &self,
+        sequences: Vec<Vec<u16>>,
+        option: RnnOption,
+        token_chunk_size: usize,
+    ) -> Result<Vec<TensorCpu<f32>>> {
+        if sequences.is_empty() {
+            bail!("sequences cannot be empty")
+        }
+        if sequences.iter().any(|s| s.is_empty()) {
+            bail!("each sequence must have at least one token")
+        }
+
+        let num_batch = sequences.len();
+        let batches: Vec<RnnInputBatch> = sequences
+            .into_iter()
+            .map(|tokens| {
+                let tokens: Vec<u32> = tokens.into_iter().map(|t| t as u32).collect();
+                RnnInputBatch::new(tokens, option)
+            })
+            .collect();
+
+        let mut inference = Some(RnnInput::new(batches, token_chunk_size));
+        let mut batch_data: Vec<Vec<f32>> = vec![vec![]; num_batch];
+        let mut batch_tokens: Vec<usize> = vec![0; num_batch];
+
+        loop {
+            let input = inference.take().unwrap();
+            let all_empty = input.batches.iter().all(|b| b.tokens.is_empty());
+            if all_empty {
+                break;
+            }
+
+            let (input, output) = match self.runtime.infer(input).await {
+                Ok(output) => output,
+                Err(err) => {
+                    bail!(err);
+                }
+            };
+
+            for (i, batch_output) in output.0.iter().enumerate() {
+                let tokens_in_batch = batch_output.0.shape()[1];
+                if tokens_in_batch > 0 {
+                    batch_tokens[i] += tokens_in_batch;
+                    let mut output_data = batch_output.0.clone().to_vec();
+                    batch_data[i].append(&mut output_data);
+                }
+            }
+            inference.replace(input);
+        }
+
+        let num_emb = self.info.num_emb;
+        let results: Result<Vec<_>> = batch_data
+            .into_iter()
+            .zip(batch_tokens.iter())
+            .map(|(data, &num_token)| {
+                TensorCpu::from_data([num_emb, num_token, 1, 1], data)
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+            })
+            .collect();
+
+        results
     }
 }
 
