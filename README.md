@@ -34,12 +34,17 @@ This fork adds the ability to load RWKV models in [GGUF format](https://github.c
 ## Quick Start
 
 ```bash
-# Load a GGUF model
-cargo run --release --example chat -- --model /path/to/model.gguf
+# Interactive chat (uses default model)
+./chat.sh
 
-# Load a SafeTensors model (unchanged from upstream)
-cargo run --release --example chat -- --model /path/to/model.st
+# With custom model
+./chat.sh -m /path/to/model.gguf
+
+# Or directly with cargo
+cargo run --release --example chat -- --model /path/to/model.gguf
 ```
+
+Run `./chat.sh -h` for all options.
 
 ## Benchmarking
 
