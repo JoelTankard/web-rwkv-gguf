@@ -204,7 +204,7 @@ The bottleneck is fundamentally in the dequantization compute:
 
 ---
 
-### Phase 3: Memory Layout (1 week)
+### Phase 3: Memory Layout (skip)
 
 **Goal:** Additional 1.2-1.4x through better memory access
 

@@ -35,6 +35,8 @@
 #![doc = document_features::document_features!()]
 
 pub mod context;
+#[cfg(all(target_os = "macos", feature = "metal-backend"))]
+pub mod metal;
 pub mod num;
 pub mod profiler;
 pub mod runtime;

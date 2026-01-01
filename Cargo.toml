@@ -63,6 +63,10 @@ uid = "0.1"
 wasm-bindgen = "0.2"
 wgpu = "27.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.30"
+objc = "0.2"
+
 [dependencies.web-rwkv-derive]
 path = "crates/web-rwkv-derive"
 version = "0.10"
@@ -98,6 +102,8 @@ web = []
 
 ## Enables subgroup operations in the kernels. Accelerates the inference on some device.
 subgroup-ops = []
+## Enables native Metal backend for accelerated inference on macOS.
+metal-backend = []
 ## Enables tokio's multi-threaded runtime. Doesn't work on web platforms.
 tokio = ["dep:tokio"]
 ## Enables performance tracing.
