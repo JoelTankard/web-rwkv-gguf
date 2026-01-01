@@ -1317,6 +1317,7 @@ impl TensorOp {
         );
 
         // Select shader based on f16 support and subgroup-ops feature
+        // Priority: subgroup+f16 > subgroup > f16 > basic
         #[cfg(not(feature = "subgroup-ops"))]
         let shader_source = if use_f16 {
             include_str!("../shaders/matmul_vec_q4k_f16.wgsl")
@@ -1325,7 +1326,7 @@ impl TensorOp {
         };
         #[cfg(feature = "subgroup-ops")]
         let shader_source = if use_f16 {
-            include_str!("../shaders/matmul_vec_q4k_f16.wgsl")
+            include_str!("../shaders/subgroup/matmul_vec_q4k_f16.wgsl")
         } else {
             include_str!("../shaders/subgroup/matmul_vec_q4k.wgsl")
         };
