@@ -860,9 +860,23 @@ impl<R: Reader> Loader<R> {
                 let w: TensorGpu<u8, ReadWrite> =
                     TensorGpu::from_data_u8(context, block_data_shape, &transposed)?;
 
+                // Create Metal buffer for Q4K weights (if Metal backend is enabled)
+                #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+                if let Some(metal_ctx) = context.metal() {
+                    use crate::metal::BufferId;
+                    let buffer_id = BufferId::from_tensor_id(w.id());
+                    metal_ctx.get_or_create_buffer(buffer_id, &transposed);
+                    log::debug!("Created Metal buffer for Q4K tensor: {name}");
+                }
+
                 // Create a dummy tensor with the logical matrix shape for metadata
                 let s: TensorGpu<u8, ReadWrite> = context.tensor_init(shape);
 
+                log::info!(
+                    "native Q4_K load: {name} ({} elements, {} bytes)",
+                    num_elements,
+                    raw_data.len()
+                );
                 Ok(Some(Matrix::Q4K { w, s }))
             }
             (GgmlType::Q5K, Quant::Int8) | (GgmlType::Q5K, Quant::None) => {

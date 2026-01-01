@@ -32,6 +32,9 @@ use crate::{
     },
 };
 
+#[cfg(all(target_os = "macos", feature = "metal-backend"))]
+use crate::metal::{MetalLayerBuffers, MetalLayerDispatcher, MetalLayerState, MetalLayerWeights};
+
 #[derive(Debug, Clone, Serialize, DeserializeSeed)]
 #[serde_seed(seed = "Seed", context = "Context")]
 pub struct Model {
@@ -520,6 +523,11 @@ pub struct Bundle<F: Float> {
     buffers: ResourceCache<usize, Runtime<F>>,
     headers: ResourceCache<usize, Header<F>>,
     phantom: PhantomData<F>,
+
+    #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+    metal_dispatcher: Option<Arc<MetalLayerDispatcher>>,
+    #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+    metal_weights: Option<Arc<Vec<MetalLayerWeights>>>,
 }
 
 impl<F: Float> Bundle<F> {
@@ -531,11 +539,58 @@ impl<F: Float> Bundle<F> {
             let shape = Shape::new(info.num_emb, head_size + 2, num_batch, 1);
             let data = (0..info.num_layer).map(|_| context.zeros(shape)).collect();
             State {
-                context,
+                context: context.clone(),
                 info,
                 data,
             }
         };
+
+        // Initialize Metal backend if available
+        #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+        let (metal_dispatcher, metal_weights) = {
+            if let Some(metal_ctx) = context.metal() {
+                log::info!("Metal context available, attempting to extract layer weights...");
+
+                // Create Metal layer weights from wgpu weights
+                let mut failed_layer = None;
+                let weights: Vec<_> = model
+                    .tensor
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, layer)| {
+                        let result = MetalLayerWeights::from_layer(layer);
+                        if result.is_none() && failed_layer.is_none() {
+                            failed_layer = Some(i);
+                        }
+                        result
+                    })
+                    .collect();
+
+                let all_ok: Option<Vec<_>> = weights.into_iter().collect();
+
+                match all_ok {
+                    Some(w) => {
+                        log::info!("Metal backend enabled: {} layers initialized", w.len());
+                        (
+                            Some(Arc::new(MetalLayerDispatcher::new(metal_ctx.clone()))),
+                            Some(Arc::new(w)),
+                        )
+                    }
+                    None => {
+                        log::warn!(
+                            "Metal backend: failed to extract layer weights at layer {:?}",
+                            failed_layer
+                        );
+                        (None, None)
+                    }
+                }
+            } else {
+                log::debug!("Metal context not available");
+                (None, None)
+            }
+        };
+
         Self {
             model,
             state,
@@ -543,6 +598,10 @@ impl<F: Float> Bundle<F> {
             buffers: ResourceCache::new(4),
             headers: ResourceCache::new(4),
             phantom: PhantomData,
+            #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+            metal_dispatcher,
+            #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+            metal_weights,
         }
     }
 
@@ -610,6 +669,20 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
     type Info = RnnInfo;
 
     fn dispatch(&self, seed: Self::Info) -> Result<RnnJob, RuntimeError> {
+        // Use Metal dispatch if available
+        #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+        if self.metal_dispatcher.is_some() && self.metal_weights.is_some() {
+            return self.dispatch_metal(seed);
+        }
+
+        // Fallback to wgpu dispatch
+        self.dispatch_wgpu(seed)
+    }
+}
+
+impl<F: Float> Bundle<F> {
+    /// Standard wgpu dispatch path.
+    fn dispatch_wgpu(&self, seed: RnnInfo) -> Result<RnnJob, RuntimeError> {
         let model = &self.model;
         let state = &self.state;
         let context = &model.context;
@@ -712,6 +785,170 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
             let _span = tracing::trace_span!("encode").entered();
             context.encode(&TensorOp::List(ops))
         };
+
+        Ok(RnnJob {
+            commands,
+            redirect,
+            embed: model.tensor.embed.w.clone(),
+            cursors: buffer.cursors.clone(),
+            input: buffer.input.clone(),
+            output: header.head_o.clone(),
+        })
+    }
+
+    /// Pure Metal dispatch path - executes entire layers in Metal.
+    #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+    fn dispatch_metal(&self, seed: RnnInfo) -> Result<RnnJob, RuntimeError> {
+        use std::time::Instant;
+        let t0 = Instant::now();
+
+        let model = &self.model;
+        let state = &self.state;
+        let context = &model.context;
+        let info = &model.info;
+        let tensor = &model.tensor;
+
+        let num_token = seed.num_token();
+        let head_size = info.num_emb / info.num_head;
+
+        let redirect = seed.redirect();
+        let num_header = redirect.headers.len();
+
+        let buffer = self.checkout_buffer(context, info, num_token);
+        let header = self.checkout_header(context, info, num_header);
+
+        context.maintain();
+        self.buffers.maintain();
+        self.headers.maintain();
+
+        if num_token == 0 {
+            return Ok(RnnJob {
+                commands: vec![],
+                redirect,
+                embed: model.tensor.embed.w.clone(),
+                cursors: buffer.cursors.clone(),
+                input: buffer.input.clone(),
+                output: header.head_o.clone(),
+            });
+        }
+
+        let metal_dispatcher = self.metal_dispatcher.as_ref().unwrap();
+        let metal_weights = self.metal_weights.as_ref().unwrap();
+
+        let t1 = Instant::now();
+
+        // Phase 1: Embedding (wgpu)
+        let embed_ops = TensorOp::List(vec![
+            TensorOp::layer_norm(
+                &tensor.embed.ln.w,
+                &tensor.embed.ln.b,
+                &buffer.input,
+                Model::LN_EPS,
+            )?,
+            TensorOp::blit(&buffer.input, &buffer.x)?,
+        ]);
+        context.queue.submit(context.encode(&embed_ops));
+
+        // Sync wgpu -> Metal
+        let _ = context.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+
+        let t2 = Instant::now();
+
+        // Phase 2: Layers (pure Metal)
+        // Extract Metal buffers from wgpu runtime buffers
+        let metal_buffers = MetalLayerBuffers::from_runtime(
+            buffer.as_ref(),
+            info.num_emb,
+            info.num_head,
+            info.num_hidden,
+        );
+
+        let t3 = Instant::now();
+
+        if let Some(buffers) = metal_buffers {
+            // Create a SINGLE command buffer and encoder for ALL layers
+            let cmd = metal_dispatcher.begin_command_buffer();
+            let encoder = cmd.new_compute_command_encoder();
+
+            let t4 = Instant::now();
+
+            for (index, layer_weights) in metal_weights.iter().enumerate() {
+                // Get state buffer for this layer
+                let state_buffer = &state.data[index].buffer;
+
+                if let Some(metal_state) =
+                    MetalLayerState::from_state(state_buffer, info.num_emb, head_size)
+                {
+                    // Encode layer into the shared encoder (no sync, no new encoder)
+                    metal_dispatcher.dispatch_layer(
+                        &encoder,
+                        layer_weights,
+                        &buffers,
+                        &metal_state,
+                        index,
+                        model.rescale,
+                    );
+                } else {
+                    // Fallback to wgpu for this layer
+                    encoder.end_encoding();
+                    log::warn!(
+                        "Metal: failed to extract state for layer {}, falling back to wgpu",
+                        index
+                    );
+                    return self.dispatch_wgpu(seed);
+                }
+            }
+
+            // End encoding ONCE after all layers
+            encoder.end_encoding();
+
+            let t5 = Instant::now();
+
+            // Sync ONCE after all layers are encoded
+            metal_dispatcher.commit_and_wait(cmd);
+
+            let t6 = Instant::now();
+
+            // Print timing breakdown (only for single token generation)
+            if num_token == 1 {
+                eprintln!(
+                    "[Metal timing] setup={:.2}ms embed={:.2}ms buf_extract={:.2}ms encode={:.2}ms exec={:.2}ms total={:.2}ms",
+                    t1.duration_since(t0).as_secs_f64() * 1000.0,
+                    t2.duration_since(t1).as_secs_f64() * 1000.0,
+                    t3.duration_since(t2).as_secs_f64() * 1000.0,
+                    t5.duration_since(t4).as_secs_f64() * 1000.0,
+                    t6.duration_since(t5).as_secs_f64() * 1000.0,
+                    t6.duration_since(t0).as_secs_f64() * 1000.0,
+                );
+            }
+        } else {
+            // Fallback to wgpu
+            log::warn!("Metal: failed to extract buffers, falling back to wgpu");
+            return self.dispatch_wgpu(seed);
+        }
+
+        // Phase 3: Header (wgpu)
+        let (head_op, head_x) = redirect.op(&buffer.x, &header.head_x)?;
+        let frame = Frame {
+            state: state.clone(),
+            buffer: buffer.clone(),
+            header: header.clone(),
+        };
+
+        let header_ops = dispatch_header(
+            self.hooks.clone(),
+            frame,
+            model.tensor.head.clone(),
+            head_x,
+            num_header,
+            head_op,
+            seed.is_embed_only(),
+        )?;
+
+        let commands = context.encode(&header_ops);
 
         Ok(RnnJob {
             commands,

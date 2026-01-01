@@ -58,11 +58,7 @@ const QUALITY_GEN_LENGTH: usize = 32;
 )]
 struct Args {
     /// Path to model file (.gguf)
-    #[arg(
-        short,
-        long,
-        default_value = "assets/models/rwkv7-g1b-2.9b-20251205-ctx8192-Q4_K_M.gguf"
-    )]
+    #[arg(short, long, default_value = "assets/models/2.9b-Q4_K_M.gguf")]
     model: PathBuf,
 
     /// Title for this benchmark group (tests with same title are grouped)

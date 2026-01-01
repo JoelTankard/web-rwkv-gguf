@@ -141,7 +141,12 @@ impl Matrix {
             Matrix::Fp16(matrix) => TensorOp::matmul_vec_fp16(matrix, input, output, act, false),
             Matrix::Int8 { w, m } => TensorOp::matmul_vec_int8(w, m, input, output, act, false),
             Matrix::Fp4 { w, q, m } => TensorOp::matmul_vec_nf4(w, q, m, input, output, act, false),
-            Matrix::Q4K { w, s } => TensorOp::matmul_vec_q4k_opt(w, s, input, output, act),
+            Matrix::Q4K { w, s } => {
+                // Metal Q4K matmul is 4.78x faster than WebGPU in isolation,
+                // but per-op sync overhead makes it slower in practice.
+                // TODO: Implement pure Metal layer execution to avoid sync overhead.
+                TensorOp::matmul_vec_q4k(w, s, input, output, act)
+            }
             Matrix::Q5K { w, s } => TensorOp::matmul_vec_q5k(w, s, input, output, act),
             Matrix::Q6K { w, s } => TensorOp::matmul_vec_q6k(w, s, input, output, act),
             Matrix::Q8_0 { w, s } => TensorOp::matmul_vec_q8_0(w, s, input, output, act),
@@ -175,7 +180,11 @@ impl Matrix {
             Matrix::Fp16(matrix) => TensorOp::matmul_mat_fp16(matrix, input, output, act),
             Matrix::Int8 { w, m } => TensorOp::matmul_mat_int8(w, m, input, output, act),
             Matrix::Fp4 { w, q, m } => TensorOp::matmul_mat_nf4(w, q, m, input, output, act),
-            Matrix::Q4K { w, s } => TensorOp::matmul_mat_q4k_opt(w, s, input, output, act),
+            Matrix::Q4K { w, s } => {
+                // Metal matmul_mat disabled - batched execution breaks data dependencies
+                // TODO: Implement interleaved Metal/wgpu execution
+                TensorOp::matmul_mat_q4k_opt(w, s, input, output, act)
+            }
             Matrix::Q5K { w, s } => TensorOp::matmul_mat_q5k(w, s, input, output, act),
             Matrix::Q6K { w, s } => TensorOp::matmul_mat_q6k(w, s, input, output, act),
             Matrix::Q8_0 { w, s } => TensorOp::matmul_mat_q8_0(w, s, input, output, act),

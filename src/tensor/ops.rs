@@ -127,6 +127,10 @@ impl crate::context::Context {
                     std::mem::swap(&mut temp, passes);
                     commands.push(temp);
                 }
+                #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+                TensorOp::MetalMatmulQ4K { .. } | TensorOp::MetalMatmulMatQ4K { .. } => {
+                    // Metal ops disabled for now - skip
+                }
             }
         }
 
@@ -162,6 +166,138 @@ impl crate::context::Context {
                 encoder.finish()
             })
             .collect()
+    }
+
+    /// Execute Metal operations in a batched command buffer.
+    #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+    fn execute_metal_ops(&self, ops: &[&TensorOp]) {
+        use crate::metal::{get_metal_buffer_from_wgpu, BufferId, MetalOps};
+
+        let Some(metal_ctx) = self.metal() else {
+            return;
+        };
+
+        // Create a single command buffer for all Metal ops
+        let cmd = metal_ctx.queue().new_command_buffer();
+
+        for op in ops {
+            match op {
+                TensorOp::MetalMatmulQ4K {
+                    weight_id,
+                    input,
+                    output,
+                    k,
+                    m,
+                    ..
+                } => {
+                    let buffer_id = BufferId::new(*weight_id);
+                    let Some(weights) = metal_ctx.get_buffer(buffer_id) else {
+                        continue;
+                    };
+                    let Some(input_metal) = get_metal_buffer_from_wgpu(input) else {
+                        continue;
+                    };
+                    let Some(output_metal) = get_metal_buffer_from_wgpu(output) else {
+                        continue;
+                    };
+                    MetalOps::encode_matmul_vec_q4k(
+                        metal_ctx,
+                        cmd,
+                        &weights,
+                        &input_metal,
+                        &output_metal,
+                        *k,
+                        *m,
+                    );
+                }
+                TensorOp::MetalMatmulMatQ4K {
+                    weight_id,
+                    input,
+                    output,
+                    k,
+                    m,
+                    n,
+                } => {
+                    let buffer_id = BufferId::new(*weight_id);
+                    let Some(weights) = metal_ctx.get_buffer(buffer_id) else {
+                        continue;
+                    };
+                    let Some(input_metal) = get_metal_buffer_from_wgpu(input) else {
+                        continue;
+                    };
+                    let Some(output_metal) = get_metal_buffer_from_wgpu(output) else {
+                        continue;
+                    };
+                    MetalOps::encode_matmul_mat_q4k(
+                        metal_ctx,
+                        cmd,
+                        &weights,
+                        &input_metal,
+                        &output_metal,
+                        *k,
+                        *m,
+                        *n,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        cmd.commit();
+        cmd.wait_until_completed();
+    }
+
+    /// Execute multiple Metal operations in a single batched command buffer.
+    /// This minimizes synchronization overhead by batching all Metal matmuls together.
+    #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+    #[allow(dead_code)]
+    fn execute_metal_ops_batched(&self, ops: &[&TensorOp]) {
+        use crate::metal::{get_metal_buffer_from_wgpu, BufferId, MetalOps};
+
+        let Some(metal_ctx) = self.metal() else {
+            return;
+        };
+
+        // Create a single command buffer for all Metal operations
+        let cmd = metal_ctx.queue().new_command_buffer();
+
+        for op in ops {
+            if let TensorOp::MetalMatmulQ4K {
+                weight_id,
+                input,
+                output,
+                k,
+                m,
+                ..
+            } = op
+            {
+                let buffer_id = BufferId::new(*weight_id);
+                let Some(weights) = metal_ctx.get_buffer(buffer_id) else {
+                    continue;
+                };
+                let Some(input_metal) = get_metal_buffer_from_wgpu(input) else {
+                    continue;
+                };
+                let Some(output_metal) = get_metal_buffer_from_wgpu(output) else {
+                    continue;
+                };
+
+                // Encode into the shared command buffer
+                MetalOps::encode_matmul_vec_q4k(
+                    metal_ctx,
+                    &cmd,
+                    &weights,
+                    &input_metal,
+                    &output_metal,
+                    *k,
+                    *m,
+                );
+            }
+        }
+
+        // Commit and wait for all Metal operations to complete
+        cmd.commit();
+        cmd.wait_until_completed();
     }
 }
 
@@ -315,6 +451,27 @@ pub enum TensorOp {
     },
     List(Vec<TensorOp>),
     Sep,
+    /// Metal Q4K vector-matrix matmul operation (single token).
+    #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+    MetalMatmulQ4K {
+        weight_id: u64,
+        input: Arc<wgpu::Buffer>,
+        output: Arc<wgpu::Buffer>,
+        k: u32,
+        m: u32,
+        input_offset: u64,
+        output_offset: u64,
+    },
+    /// Metal Q4K matrix-matrix matmul operation (batch/prefill).
+    #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+    MetalMatmulMatQ4K {
+        weight_id: u64,
+        input: Arc<wgpu::Buffer>,
+        output: Arc<wgpu::Buffer>,
+        k: u32,
+        m: u32,
+        n: u32, // Number of tokens (batch size)
+    },
 }
 
 impl TensorOp {
@@ -1361,6 +1518,79 @@ impl TensorOp {
                 shape[1] as u32,
                 shape[2] as u32,
             ],
+        })
+    }
+
+    /// Q4_K matrix-vector multiplication using Metal backend.
+    /// Creates a MetalMatmulQ4K op that will be batched and executed after all wgpu ops.
+    #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+    pub fn matmul_vec_q4k_metal<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        _act: Activation,
+    ) -> Result<Self, TensorError> {
+        use crate::metal::BufferId;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let logical_shape = matrix_shape.shape();
+        {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+        }
+
+        // Get the tensor ID for the weight buffer (used as cache key in MetalContext)
+        let weight_id = BufferId::from_tensor_id(matrix.id()).get();
+
+        // K and M dimensions for the Metal kernel
+        let k = logical_shape[0] as u32;
+        let m = logical_shape[1] as u32;
+
+        Ok(Self::MetalMatmulQ4K {
+            weight_id,
+            input: input.tensor().data.buffer.clone(),
+            output: output.tensor().data.buffer.clone(),
+            k,
+            m,
+            input_offset: 0, // Views start at offset 0 for now
+            output_offset: 0,
+        })
+    }
+
+    /// Q4_K matrix-matrix multiplication using Metal backend.
+    #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+    pub fn matmul_mat_q4k_metal<'a, 'b, F0: Float, F1: Float>(
+        matrix: &TensorGpu<u8, ReadWrite>,
+        matrix_shape: &TensorGpu<u8, ReadWrite>,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        output: impl Into<TensorGpuView<'b, F1>>,
+        _act: Activation,
+    ) -> Result<Self, TensorError> {
+        use crate::metal::BufferId;
+
+        let input: TensorGpuView<_> = input.into();
+        let output: TensorGpuView<_> = output.into();
+
+        let logical_shape = matrix_shape.shape();
+        let [m, n, b, _] = output.shape().into();
+        let [k, _, _, _] = input.shape().into();
+        input.check_shape([k, n, b, 1])?;
+        output.check_shape([m, n, b, 1])?;
+
+        let weight_id = BufferId::from_tensor_id(matrix.id()).get();
+
+        Ok(Self::MetalMatmulMatQ4K {
+            weight_id,
+            input: input.tensor().data.buffer.clone(),
+            output: output.tensor().data.buffer.clone(),
+            k: logical_shape[0] as u32,
+            m: logical_shape[1] as u32,
+            n: n as u32,
         })
     }
 

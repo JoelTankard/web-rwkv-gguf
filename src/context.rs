@@ -22,6 +22,9 @@ use crate::{
     },
 };
 
+#[cfg(all(target_os = "macos", feature = "metal-backend"))]
+use crate::metal::MetalContext;
+
 pub trait InstanceExt {
     fn adapter(
         &self,
@@ -65,6 +68,9 @@ pub struct Context {
 
     #[cfg(not(target_arch = "wasm32"))]
     event: flume::Sender<ContextEvent>,
+
+    #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+    metal: Option<Arc<MetalContext>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -144,6 +150,9 @@ impl ContextBuilder {
 
         let profiler = GpuProfiler::new(&device, &queue);
 
+        #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+        let metal = MetalContext::new().map(Arc::new);
+
         let context = Context {
             id: uid::Id::new(),
             adapter,
@@ -156,6 +165,8 @@ impl ContextBuilder {
             bindings: SharedResourceCache::new(64),
             #[cfg(not(target_arch = "wasm32"))]
             event,
+            #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+            metal,
         };
 
         // start a thread for reading back buffers
@@ -451,6 +462,12 @@ impl Context {
     /// Check if the device supports SHADER_F16 for faster f16 arithmetic in shaders.
     pub fn supports_shader_f16(&self) -> bool {
         self.device.features().contains(Features::SHADER_F16)
+    }
+
+    /// Get the Metal context if available (macOS with metal-backend feature).
+    #[cfg(all(target_os = "macos", feature = "metal-backend"))]
+    pub fn metal(&self) -> Option<&Arc<MetalContext>> {
+        self.metal.as_ref()
     }
 }
 
