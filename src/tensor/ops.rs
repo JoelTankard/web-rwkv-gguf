@@ -2581,6 +2581,64 @@ impl TensorOp {
         })
     }
 
+    /// Pack k, v, a, kk into a single tensor n in one kernel dispatch.
+    /// This replaces 4 separate blit operations with a single kernel.
+    pub fn pack_kvakk<T: Float>(
+        k: &TensorGpu<T, ReadWrite>,
+        v: &TensorGpu<T, ReadWrite>,
+        a: &TensorGpu<T, ReadWrite>,
+        kk: &TensorGpu<T, ReadWrite>,
+        n: &TensorGpu<T, ReadWrite>,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 256;
+
+        let context = k.context();
+        let shape = k.shape();
+        let stride = shape[0] * shape[1];
+
+        v.check_shape(shape)?;
+        a.check_shape(shape)?;
+        kk.check_shape(shape)?;
+        n.check_shape([shape[0], shape[1], 4, 1])?;
+
+        let key = PipelineKey::new(
+            "pack_kvakk",
+            "main",
+            Macros::new().u32("BLOCK_SIZE", BLOCK_SIZE).tensor(k, None),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/pack_kvakk.wgsl"),
+            &[
+                k.meta_layout(0),
+                k.layout(1, true),
+                v.layout(2, true),
+                a.layout(3, true),
+                kk.layout(4, true),
+                n.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, k)
+            .bind(1, k)
+            .bind(2, v)
+            .bind(3, a)
+            .bind(4, kk)
+            .bind(5, n)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                u32::div_ceil(stride as u32 / 4, BLOCK_SIZE),
+                shape[2] as u32,
+                1,
+            ],
+        })
+    }
+
     pub fn control_k_v7<'a, 'b, F0: Float, F1: Float>(
         p: &TensorGpu<f16, ReadWrite>,
         a: impl Into<TensorGpuView<'a, F0>>,

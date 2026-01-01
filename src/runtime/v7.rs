@@ -934,10 +934,13 @@ fn dispatch_layer<F: Float>(
 
     ops.extend([
         hook_op(Hook::PreAttTimeMix(index))?,
-        TensorOp::blit(&buffer.att_k, buffer.att_n.view(.., .., 0, ..)?)?,
-        TensorOp::blit(&buffer.att_v, buffer.att_n.view(.., .., 1, ..)?)?,
-        TensorOp::blit(&buffer.att_a, buffer.att_n.view(.., .., 2, ..)?)?,
-        TensorOp::blit(&buffer.att_kk, buffer.att_n.view(.., .., 3, ..)?)?,
+        TensorOp::pack_kvakk(
+            &buffer.att_k,
+            &buffer.att_v,
+            &buffer.att_a,
+            &buffer.att_kk,
+            &buffer.att_n,
+        )?,
         TensorOp::time_mix_v7(
             &buffer.cursors,
             state.att(index)?,
