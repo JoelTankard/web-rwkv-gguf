@@ -186,3 +186,53 @@ These add compute overhead but also optimization opportunities:
 3. Benchmark chunked state updates
 4. Test F16 state quality impact
 ```
+
+## Implementation Results (2026-01-01)
+
+### Baseline Performance
+
+-   **Model**: 2.9b-Q4_K_M.gguf (RWKV v7)
+-   **GPU**: Apple M2 Max
+-   **Generation**: 44.53 tok/s
+-   **Prefill**: 152.25 tok/s
+-   **Quality Hash**: `3895ad4add71cff0`
+
+### Attempted Optimizations
+
+| Optimization         | Generation  | Prefill      | Quality | Result             |
+| -------------------- | ----------- | ------------ | ------- | ------------------ |
+| Baseline             | 44.53 tok/s | 152.25 tok/s | ✓       | -                  |
+| State access pattern | 44.10 tok/s | 151.80 tok/s | ✓       | No improvement     |
+| Workgroup size 64    | 43.58 tok/s | 150.93 tok/s | ✓       | Worse (-2%)        |
+| Fused state loops    | 44.36 tok/s | 154.70 tok/s | ✗       | Quality regression |
+
+### Key Findings
+
+1. **Current implementation is already well-optimized**: The time_mix_v7 shader uses efficient patterns with shared memory and vectorized operations.
+
+2. **Sequential dependency is fundamental**: The WKV computation requires `sa` to be fully computed before state updates, preventing loop fusion without quality loss.
+
+3. **Workgroup size 32 is optimal**: Increasing to 64 reduced performance, likely due to register pressure on Apple Silicon.
+
+4. **F16 state requires significant refactoring**: Would need changes to:
+
+    - State struct definition in v7.rs
+    - `super::model::State` trait (uses `TensorCpu<f32>`)
+    - All shader bindings for state
+    - Serialization/deserialization logic
+
+5. **Kernel fusion opportunities are limited**: Operations like `pack_kvakk` → `time_mix_v7` could be fused but require significant binding changes for uncertain gains.
+
+### Recommendations
+
+1. **F16 State** (Medium effort, potential +10%): Most promising optimization but requires careful implementation to avoid quality degradation.
+
+2. **Chunked State Updates** (High effort, potential +20% prefill): Would require architectural changes to batch token processing.
+
+3. **Layer Skipping** (Medium effort, potential +30%): Risky for quality but could be configurable for speed-critical applications.
+
+The current implementation appears to be near-optimal for the RWKV v7 architecture on WebGPU. Further gains likely require:
+
+-   Hardware-specific tuning (different workgroup sizes per GPU)
+-   Algorithmic changes (approximate attention, pruning)
+-   Lower-level optimizations (wgpu-hal, native backends)
