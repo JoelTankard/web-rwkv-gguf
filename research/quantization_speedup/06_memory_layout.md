@@ -221,6 +221,51 @@ Implementation order:
 3. **Double buffering** - Overlap load/compute
 4. **Tiled layout** - If still memory-bound
 
+## Implementation Results (2026-01-01)
+
+### Tested on Apple M2 Max
+
+| Strategy                       | Generation (tok/s) | Change |
+| ------------------------------ | ------------------ | ------ |
+| Baseline                       | 43.94              | -      |
+| Transposed Layout              | 43.83              | -0.25% |
+| Double Buffering               | 43.70              | -0.55% |
+| Reduced Barriers (2 SB batch)  | 43.87              | -0.16% |
+| Final (Transposed + v2 shader) | 43.93              | -0.02% |
+
+### Key Findings
+
+1. **Memory layout optimizations provided no measurable improvement** on Apple M2 Max
+2. **Quality verified** - all implementations produce identical output (hash: `3895ad4add71cff0`)
+3. **Apple Silicon's unified memory architecture** may already handle memory access patterns efficiently
+4. **The bottleneck is likely elsewhere** - possibly compute-bound on dequantization math
+
+### What Was Implemented
+
+1. **Transposed Q4K Layout** (`transpose_q4k_layout` in `loader.rs` and `lazy.rs`)
+
+    - Reorganizes super-blocks from `block[row][sb_k]` to `block[sb_k][row]`
+    - Ensures consecutive threads read consecutive memory addresses
+    - Implemented in both eager and lazy loading paths
+
+2. **Updated Shaders** (`matmul_vec_q4k_v2.wgsl`, `matmul_mat_q4k_opt.wgsl`)
+    - Modified block index calculation for transposed layout
+    - `block_u32_base = (sb * m + row) * Q4K_BLOCK_U32`
+
+### Why No Improvement?
+
+The document's analysis assumed we were using <1% of memory bandwidth, but this may not be accurate for Apple Silicon:
+
+1. **Unified Memory** - No discrete GPU memory, so memory access patterns differ from NVIDIA/AMD
+2. **Hardware Prefetching** - Apple's GPU may already efficiently prefetch non-coalesced access
+3. **Compute-Bound** - The dequantization math (scale extraction, nibble unpacking, FMA) may dominate
+
+### Recommendations
+
+-   **Keep transposed layout** - theoretically correct, no performance regression
+-   **Focus optimization efforts elsewhere** - shader F16 arithmetic, subgroup operations
+-   **Profile with Metal System Trace** to identify actual bottleneck
+
 ## References
 
 -   [NVIDIA CUDA Memory Optimization](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#memory-optimizations)

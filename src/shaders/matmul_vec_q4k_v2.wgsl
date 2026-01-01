@@ -149,10 +149,13 @@ fn matmul(@builtin(global_invocation_id) invocation_id: vec3<u32>, @builtin(loca
         // Each thread processes its own row using the cached input
         // This is where we save bandwidth: read Q4K (144 bytes) instead of F16 (512 bytes)
         // Input is read once and shared across BLOCK_SIZE rows
+        // Memory layout is transposed: block[sb_k][row] for coalesced access
+        // Consecutive threads (different rows) now read consecutive super-blocks
         if row < m {
             for (var r = 0u; r < 4u; r++) {
                 if row + r < m {
-                    let block_u32_base = ((row + r) * num_super_blocks_k + sb) * Q4K_BLOCK_U32;
+                    // Transposed layout: block[sb][row] instead of block[row][sb]
+                    let block_u32_base = (sb * m + (row + r)) * Q4K_BLOCK_U32;
                     local_sum[r] += dot_q4k_cached(block_u32_base);
                 }
             }

@@ -83,11 +83,13 @@ fn get_scale_min_k4(j: u32, scales_u32: array<u32, 3>) -> vec2<f32> {
 }
 
 // Dequantize a vec4 of elements from Q4_K at a given K position
-fn dequant_q4k_vec4(row: u32, k_pos: u32, num_super_blocks_k: u32) -> vec4<f32> {
+// Uses transposed layout: block[sb_k][row] for coalesced memory access
+fn dequant_q4k_vec4(row: u32, k_pos: u32, num_super_blocks_k: u32, num_rows: u32) -> vec4<f32> {
     let sb_idx = k_pos / Q4K_BLOCK_SIZE;
     let pos_in_sb = k_pos % Q4K_BLOCK_SIZE;
     
-    let block_u32_base = (row * num_super_blocks_k + sb_idx) * Q4K_BLOCK_U32;
+    // Transposed layout: block[sb_idx][row] instead of block[row][sb_idx]
+    let block_u32_base = (sb_idx * num_rows + row) * Q4K_BLOCK_U32;
     let d_dmin = unpack2x16float(matrix[block_u32_base]);
     let d = d_dmin.x;
     let dmin = d_dmin.y;
@@ -157,7 +159,7 @@ fn matmul(in: Input) {
             var y = b.x + j;
             if y < ra.y && x < ra.x {
                 let k_pos = x * 4u;  // Convert vec4 index to element index
-                sa[j][i] = dequant_q4k_vec4(y, k_pos, num_super_blocks_k);
+                sa[j][i] = dequant_q4k_vec4(y, k_pos, num_super_blocks_k, m);
             } else {
                 sa[j][i] = vec4<f32>(0.0);
             }

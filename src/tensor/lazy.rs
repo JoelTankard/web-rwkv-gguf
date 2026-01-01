@@ -8,6 +8,22 @@ use super::{
 };
 use crate::context::Context;
 
+const Q4K_BLOCK_BYTES: usize = 144;
+
+/// Transpose Q4K layout from row-major to column-major for coalesced memory access.
+fn transpose_q4k_layout(raw_data: &[u8], num_rows: usize, num_sb_k: usize) -> Vec<u8> {
+    let mut transposed = vec![0u8; raw_data.len()];
+    for row in 0..num_rows {
+        for sb_k in 0..num_sb_k {
+            let src_offset = (row * num_sb_k + sb_k) * Q4K_BLOCK_BYTES;
+            let dst_offset = (sb_k * num_rows + row) * Q4K_BLOCK_BYTES;
+            transposed[dst_offset..dst_offset + Q4K_BLOCK_BYTES]
+                .copy_from_slice(&raw_data[src_offset..src_offset + Q4K_BLOCK_BYTES]);
+        }
+    }
+    transposed
+}
+
 /// Lazy matrix that defers GPU upload until first use.
 /// This is the main optimization for fast model loading.
 #[derive(Debug, Clone)]
@@ -134,9 +150,15 @@ impl LazyMatrixData {
                 })
             }
             LazyMatrixVariant::Q4K { raw_data, shape } => {
-                let block_data_shape = Shape::new(raw_data.len(), 1, 1, 1);
+                // Transpose Q4K layout for coalesced memory access
+                let k = shape[0]; // K dimension (input features)
+                let m = shape[1]; // M dimension (output features/rows)
+                let num_sb_k = k / 256; // Number of super-blocks along K
+                let transposed = transpose_q4k_layout(&raw_data, m, num_sb_k);
+
+                let block_data_shape = Shape::new(transposed.len(), 1, 1, 1);
                 let w: TensorGpu<u8, ReadWrite> =
-                    TensorGpu::from_data_u8(context, block_data_shape, &raw_data)?;
+                    TensorGpu::from_data_u8(context, block_data_shape, &transposed)?;
                 let s: TensorGpu<u8, ReadWrite> = context.tensor_init(shape);
                 Ok(Matrix::Q4K { w, s })
             }
