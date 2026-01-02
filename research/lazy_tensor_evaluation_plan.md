@@ -625,7 +625,67 @@ let x = ffn_output.complete(&ffn_state, batch_index, num_tokens);
 let result = x.materialize()?;
 ```
 
-### Phase 5: Advanced Optimizations
+### Phase 5: Advanced Optimizations ✅ Complete (MatMul+Bias Fusion)
 
--   Operation fusion (MatMul → Add → Activation)
--   Memory planning with graph coloring
+#### 5.1 Operation Fusion (MatMul → Add → Activation)
+
+**Implemented:**
+
+1. **New `LazyOp::MatMulBias` variant** in `src/tensor/graph.rs`:
+
+    - Fuses `matmul(matrix, input) + bias` into a single kernel
+    - Supports activation function application after bias addition
+    - Fields: `matrix`, `input`, `bias`, `activation`, `turbo`
+
+2. **Fused shader** `src/shaders/matmul_vec_fp16_bias.wgsl`:
+
+    - Based on `matmul_vec_fp16.wgsl` with added bias binding
+    - Adds bias vector in the output step: `output = ACT(matmul_result + bias)`
+    - Bias is broadcast across tokens and batches
+
+3. **`TensorOp::matmul_vec_fp16_bias()`** in `src/tensor/ops.rs`:
+
+    - Creates the fused matmul+bias compute pipeline
+    - Currently supports `Matrix::Fp16` only (other quant types fall back to separate ops)
+
+4. **Automatic fusion optimization** in `ComputeGraph::optimize()`:
+
+    - Detects `MatMul → Add` patterns where:
+        - MatMul has `activation: None`
+        - Add's other operand is an Input node (bias tensor)
+        - Bias shape is `[R, 1, 1, 1]` (broadcastable)
+        - MatMul is only used by this Add (ref_count <= 2)
+    - Rewrites the Add node to `MatMulBias`, bypassing the intermediate MatMul
+
+5. **Lazy operation builder** `LazyTensor::matmul_bias()` in `src/tensor/lazy_ops.rs`:
+
+    - Allows explicit creation of fused matmul+bias operations
+    - Useful when the user knows they want fusion upfront
+
+6. **Tests** in `examples/test_lazy_tensor.rs`:
+    - `test_matmul_bias_fusion()` - Tests automatic fusion detection
+    - `test_explicit_matmul_bias()` - Tests explicit `matmul_bias()` API
+
+**Usage:**
+
+```rust
+// Automatic fusion (optimizer detects and fuses)
+let lazy_matmul = lazy_input.matmul(&matrix, Activation::None, false);
+let lazy_result = lazy_matmul.add(&lazy_bias);
+let buffer = lazy_result.materialize()?; // Fusion happens here
+
+// Explicit fusion (user creates fused op directly)
+let lazy_result = lazy_input.matmul_bias(&matrix, &lazy_bias, Activation::None, false);
+let buffer = lazy_result.materialize()?;
+```
+
+**Benefits:**
+
+-   Eliminates intermediate buffer allocation for matmul output
+-   Reduces kernel launch overhead (1 kernel instead of 2)
+-   Expected 5-15% speedup for linear layers with bias
+
+#### 5.2 Memory Planning with Graph Coloring
+
+-   Not yet implemented
+-   Future work: Use liveness analysis and graph coloring to minimize total memory usage

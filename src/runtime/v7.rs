@@ -23,6 +23,7 @@ use crate::{
     tensor::{
         cache::ResourceCache,
         kind::ReadWrite,
+        lazy_tensor::LazyTensor,
         matrix::Matrix,
         ops::{Activation, TensorOp},
         serialization::Seed,
@@ -487,6 +488,10 @@ impl Job for RnnJob {
     fn submit(&mut self) {
         let commands = std::mem::take(&mut self.commands);
         self.output.context.queue.submit(commands);
+
+        // Sync any pending Metal commands after WebGPU submit
+        #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+        crate::metal::sync_pending_metal_commands();
     }
 
     async fn back(self) -> Result<Self::Output, RuntimeError> {
@@ -724,6 +729,79 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
     }
 }
 
+/// Try to execute a V7 layer using pure Metal (macOS only).
+/// Returns Some(Ok(ops)) if Metal succeeded, None to fall back to WebGPU.
+#[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+#[allow(clippy::too_many_arguments)]
+fn try_metal_v7_layer<F: Float>(
+    frame: &Frame<F>,
+    layer: &Layer,
+    index: usize,
+    num_token: usize,
+    head_size: usize,
+    rescale: usize,
+) -> Option<Result<TensorOp, TensorError>> {
+    let Frame { state, buffer, .. } = frame;
+    let context = buffer.x.context();
+
+    // Get state tensors
+    let att_state = state.att(index).ok()?;
+    let ffn_state = state.ffn(index).ok()?;
+
+    // Execute entire layer via Metal with single sync point
+    let metal_success = crate::metal::v7_layer::execute_metal_v7_layer(
+        &context,
+        layer,
+        index,
+        num_token,
+        head_size,
+        &buffer.x,
+        &buffer.att_x,
+        &att_state,
+        &buffer.ffn_x,
+        &ffn_state,
+        &buffer.cursors,
+        &buffer.att_rx,
+        &buffer.att_wx,
+        &buffer.att_kx,
+        &buffer.att_vx,
+        &buffer.att_ax,
+        &buffer.att_gx,
+        &buffer.att_r,
+        &buffer.att_k,
+        &buffer.att_v,
+        &buffer.att_w,
+        &buffer.att_a,
+        &buffer.att_g,
+        &buffer.att_o,
+        &buffer.aux_w,
+        &buffer.aux_a,
+        &buffer.aux_g,
+        &buffer.att_kk,
+        &buffer.att_v0,
+        &buffer.att_vv,
+        &buffer.aux_v,
+        &buffer.att_n,
+        &buffer.ffn_kx,
+        &buffer.ffn_k,
+        &buffer.ffn_v,
+    );
+
+    if metal_success {
+        // Metal executed the layer, just return rescale op if needed
+        let mut ops = vec![];
+        if (index + 1).is_multiple_of(rescale) {
+            if let Ok(op) = TensorOp::affine(&buffer.x, 0.5, 0.0) {
+                ops.push(op);
+            }
+        }
+        return Some(Ok(TensorOp::List(ops)));
+    }
+
+    // Fall back to WebGPU
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_layer<F: Float>(
     hooks: Arc<HookMap<F>>,
@@ -734,6 +812,12 @@ fn dispatch_layer<F: Float>(
     head_size: usize,
     rescale: usize,
 ) -> Result<TensorOp, TensorError> {
+    // Try pure Metal V7 layer execution (macOS only, metal-acceleration feature)
+    #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+    if let Some(op) = try_metal_v7_layer(&frame, &layer, index, num_token, head_size, rescale) {
+        return op;
+    }
+
     let hook_op = |hook: Hook| hook_op(&hooks, &hook, &frame);
     let Frame { state, buffer, .. } = &frame;
 
@@ -967,6 +1051,7 @@ fn dispatch_layer<F: Float>(
         hook_op(Hook::PostAtt(index))?,
     ]);
 
+    // FFN: Pre-matmul operations
     ops.extend([
         TensorOp::blit(&buffer.x, &buffer.ffn_x)?,
         hook_op(Hook::PreFfn(index))?,
@@ -988,6 +1073,82 @@ fn dispatch_layer<F: Float>(
         )?,
         hook_op(Hook::PostFfnTokenShift(index))?,
         hook_op(Hook::PreFfnLinear(index))?,
+    ]);
+
+    // FFN: Matmul operations - use lazy path for Metal acceleration when enabled
+    #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+    {
+        // Check if matrices are Q4K (Metal-accelerated)
+        let is_q4k = matches!(&layer.ffn.w_k, Matrix::Q4K { .. })
+            && matches!(&layer.ffn.w_v, Matrix::Q4K { .. });
+
+        if is_q4k {
+            // Execute pre-matmul ops first to populate ffn_kx
+            let pre_ops = TensorOp::List(std::mem::take(&mut ops));
+            let context = buffer.x.context();
+            let submission = context.queue.submit(context.encode(&pre_ops));
+
+            // Wait for WebGPU to complete before Metal reads the buffers
+            let _ = context.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            });
+
+            // Use batched Metal FFN execution (deferred sync at end of forward pass)
+            let metal_success = crate::metal::execute_metal_ffn_q4k(
+                &context,
+                &layer.ffn.w_k,
+                &layer.ffn.w_v,
+                &buffer.ffn_kx,
+                &buffer.ffn_k,
+                &buffer.ffn_v,
+            );
+
+            if !metal_success {
+                // Fall back to WebGPU if Metal fails
+                log::warn!(
+                    "Metal FFN dispatch failed for layer {}, falling back to WebGPU",
+                    index
+                );
+                ops.extend([
+                    layer.ffn.w_k.matmul_op(
+                        &buffer.ffn_kx,
+                        &buffer.ffn_k,
+                        Activation::SquaredRelu,
+                        turbo(num_token),
+                    )?,
+                    hook_op(Hook::PostFfnActivate(index))?,
+                    layer.ffn.w_v.matmul_op_sparse(
+                        &buffer.ffn_k,
+                        &buffer.ffn_v,
+                        Activation::None,
+                        turbo(num_token),
+                    )?,
+                ]);
+            }
+        } else {
+            // Non-Q4K matrices: use standard WebGPU path
+            ops.extend([
+                layer.ffn.w_k.matmul_op(
+                    &buffer.ffn_kx,
+                    &buffer.ffn_k,
+                    Activation::SquaredRelu,
+                    turbo(num_token),
+                )?,
+                hook_op(Hook::PostFfnActivate(index))?,
+                layer.ffn.w_v.matmul_op_sparse(
+                    &buffer.ffn_k,
+                    &buffer.ffn_v,
+                    Activation::None,
+                    turbo(num_token),
+                )?,
+            ]);
+        }
+    }
+
+    // Standard WebGPU path (non-macOS or no metal-acceleration feature)
+    #[cfg(not(all(target_os = "macos", feature = "metal-acceleration")))]
+    ops.extend([
         layer.ffn.w_k.matmul_op(
             &buffer.ffn_kx,
             &buffer.ffn_k,
@@ -1001,6 +1162,10 @@ fn dispatch_layer<F: Float>(
             Activation::None,
             turbo(num_token),
         )?,
+    ]);
+
+    // FFN: Post-matmul operations
+    ops.extend([
         hook_op(Hook::PostFfnLinear(index))?,
         hook_op(Hook::PreFfnChannelMix(index))?,
         TensorOp::channel_mix_v7(
@@ -1019,6 +1184,57 @@ fn dispatch_layer<F: Float>(
     }
 
     Ok(TensorOp::List(ops))
+}
+
+/// Execute FFN matmuls via the lazy tensor graph.
+/// This enables Metal Q4K acceleration when the metal-acceleration feature is enabled.
+/// Returns the output buffer containing ffn_v result.
+#[allow(dead_code)]
+fn dispatch_ffn_matmuls_lazy<F: Float>(
+    context: &Context,
+    w_k: &Matrix,
+    w_v: &Matrix,
+    input: &TensorGpu<F, ReadWrite>,
+    intermediate: &TensorGpu<F, ReadWrite>,
+    output: &TensorGpu<F, ReadWrite>,
+    turbo: bool,
+) -> Result<(), TensorError> {
+    // Create lazy tensors from the GPU buffers (treats as f16 internally)
+    let lazy_input: LazyTensor<f16> = LazyTensor::from_gpu_generic(input);
+
+    // First matmul: input -> intermediate (with SquaredRelu)
+    let lazy_k = lazy_input.matmul(w_k, Activation::SquaredRelu, turbo);
+
+    // Second matmul: intermediate -> output (no activation)
+    let lazy_v = lazy_k.matmul(w_v, Activation::None, turbo);
+
+    // Materialize the result into the output buffer
+    // The lazy graph will use Metal for Q4K matrices when available
+    let result = lazy_v.materialize()?;
+
+    // Copy result to the expected output buffer if different
+    if !Arc::ptr_eq(&result, &output.buffer) {
+        let mut encoder = context.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&result, 0, &output.buffer, 0, output.size() as u64);
+        context.queue.submit(Some(encoder.finish()));
+    }
+
+    // Also copy to intermediate buffer for hooks (ffn_k)
+    // The lazy graph already computed this internally, but we need it in the buffer
+    let lazy_k_result = lazy_k.materialize()?;
+    if !Arc::ptr_eq(&lazy_k_result, &intermediate.buffer) {
+        let mut encoder = context.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(
+            &lazy_k_result,
+            0,
+            &intermediate.buffer,
+            0,
+            intermediate.size() as u64,
+        );
+        context.queue.submit(Some(encoder.finish()));
+    }
+
+    Ok(())
 }
 
 fn dispatch_header<F: Float>(

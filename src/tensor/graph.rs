@@ -237,6 +237,17 @@ pub enum LazyOp {
         n: NodeIndex,
         x: NodeIndex,
     },
+
+    /// Fused matrix multiplication with bias addition.
+    /// Combines: output = activation(matmul(matrix, input) + bias)
+    /// This is an optimization that fuses MatMul → Add into a single kernel.
+    MatMulBias {
+        matrix: MatrixRef,
+        input: NodeIndex,
+        bias: NodeIndex,
+        activation: Activation,
+        turbo: bool,
+    },
 }
 
 impl LazyOp {
@@ -285,6 +296,7 @@ impl LazyOp {
             LazyOp::ControlKV7 { p, a, k } => vec![*p, *a, *k],
             LazyOp::PackKvakk { k, v, a, kk } => vec![*k, *v, *a, *kk],
             LazyOp::TimeFirstV7 { u, r, n, x } => vec![*u, *r, *n, *x],
+            LazyOp::MatMulBias { input, bias, .. } => vec![*input, *bias],
         }
     }
 }
@@ -480,6 +492,109 @@ impl ComputeGraph {
         }
     }
 
+    /// Optimize the graph by fusing operations.
+    /// Currently supports:
+    /// - MatMul → Add (bias) fusion: Combines matmul with bias addition into a single kernel.
+    ///
+    /// Returns the number of fusions performed.
+    pub fn optimize(&mut self) -> usize {
+        let mut fusions = 0;
+
+        // Collect fusion candidates: (add_node_idx, matmul_node_idx, bias_node_idx)
+        let mut candidates: Vec<(NodeIndex, NodeIndex, NodeIndex)> = Vec::new();
+
+        for idx in 0..self.nodes.len() {
+            let node_idx = NodeIndex(idx);
+            if let Some(node) = self.get(node_idx) {
+                // Look for Add nodes
+                if let LazyOp::Add { lhs, rhs } = &node.operation {
+                    // Check if lhs is a MatMul with no activation
+                    if let Some(lhs_node) = self.get(*lhs) {
+                        if let LazyOp::MatMul {
+                            activation: Activation::None,
+                            ..
+                        } = &lhs_node.operation
+                        {
+                            // Check if rhs is a bias (Input node with shape [R, 1, 1, 1])
+                            if let Some(rhs_node) = self.get(*rhs) {
+                                if matches!(rhs_node.operation, LazyOp::Input { .. }) {
+                                    let bias_shape = rhs_node.info.shape;
+                                    // Bias should be 1D (broadcast across tokens and batches)
+                                    if bias_shape[1] == 1 && bias_shape[2] == 1 {
+                                        // Check that the matmul output matches bias dimension
+                                        if lhs_node.info.shape[0] == bias_shape[0] {
+                                            // Only fuse if matmul is only used by this Add
+                                            // ref_count == 2 means: 1 from initial creation + 1 from Add's dependency
+                                            if lhs_node.ref_count <= 2 {
+                                                candidates.push((node_idx, *lhs, *rhs));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Also check the reverse: rhs is MatMul, lhs is bias
+                    if let Some(rhs_node) = self.get(*rhs) {
+                        if let LazyOp::MatMul {
+                            activation: Activation::None,
+                            ..
+                        } = &rhs_node.operation
+                        {
+                            if let Some(lhs_node) = self.get(*lhs) {
+                                if matches!(lhs_node.operation, LazyOp::Input { .. }) {
+                                    let bias_shape = lhs_node.info.shape;
+                                    if bias_shape[1] == 1 && bias_shape[2] == 1 {
+                                        if rhs_node.info.shape[0] == bias_shape[0] {
+                                            // ref_count <= 2: 1 from initial + 1 from Add's dependency
+                                            if rhs_node.ref_count <= 2 {
+                                                candidates.push((node_idx, *rhs, *lhs));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply fusions
+        for (add_idx, matmul_idx, bias_idx) in candidates {
+            if let Some(matmul_node) = self.get(matmul_idx) {
+                if let LazyOp::MatMul {
+                    matrix,
+                    input,
+                    turbo,
+                    ..
+                } = &matmul_node.operation
+                {
+                    let matrix = matrix.clone();
+                    let input = *input;
+                    let turbo = *turbo;
+                    let output_info = matmul_node.info.clone();
+
+                    // Replace the Add node's operation with MatMulBias
+                    if let Some(add_node) = self.get_mut(add_idx) {
+                        add_node.operation = LazyOp::MatMulBias {
+                            matrix,
+                            input,
+                            bias: bias_idx,
+                            activation: Activation::None,
+                            turbo,
+                        };
+                        add_node.info = output_info;
+                        fusions += 1;
+                    }
+                }
+            }
+        }
+
+        fusions
+    }
+
     /// Resolve a node, executing all dependencies and returning the result buffer.
     ///
     /// This is the core execution method for lazy evaluation:
@@ -500,6 +615,12 @@ impl ComputeGraph {
             }
         } else {
             return Err(TensorErrorKind::Deduce.into());
+        }
+
+        // Apply graph optimizations before execution
+        let fusions = self.optimize();
+        if fusions > 0 {
+            log::debug!("Graph optimization: {} fusions applied", fusions);
         }
 
         // Get execution order via topological sort
@@ -637,6 +758,24 @@ impl ComputeGraph {
                     None => TensorInitContext::init(context, output_shape),
                 };
                 let input_tensor = self.wrap_buffer_as_tensor(context, input_buffer, input_shape);
+
+                // Try Metal dispatch for Q4K matrices on macOS
+                #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+                if let super::matrix::Matrix::Q4K { w, .. } = matrix {
+                    if let Some(output_buf) = self.execute_metal_q4k_matmul(
+                        context,
+                        w,
+                        &input_tensor,
+                        &output,
+                        activation,
+                    ) {
+                        if let Some(node) = self.get_mut(idx) {
+                            node.buffer = Some(output_buf);
+                        }
+                        return Ok(());
+                    }
+                    // Fall through to WebGPU if Metal fails
+                }
 
                 let op = matrix.matmul_op(&input_tensor, &output, activation, turbo)?;
                 context.queue.submit(context.encode(&op));
@@ -1376,6 +1515,95 @@ impl ComputeGraph {
                 }
                 Ok(())
             }
+
+            LazyOp::MatMulBias {
+                matrix,
+                input,
+                bias,
+                activation,
+                turbo,
+            } => {
+                let input_buffer = self
+                    .get(*input)
+                    .and_then(|n| n.buffer.clone())
+                    .or_else(|| buffer_plan.get(*input))
+                    .ok_or(TensorErrorKind::Deduce)?;
+                let bias_buffer = self
+                    .get(*bias)
+                    .and_then(|n| n.buffer.clone())
+                    .or_else(|| buffer_plan.get(*bias))
+                    .ok_or(TensorErrorKind::Deduce)?;
+                let input_shape = self.get(*input).ok_or(TensorErrorKind::Deduce)?.info.shape;
+                let bias_shape = self.get(*bias).ok_or(TensorErrorKind::Deduce)?.info.shape;
+
+                let matrix = unsafe { matrix.get() };
+                let activation = *activation;
+                let turbo = *turbo;
+
+                let output: TensorGpu<f16, ReadWrite> = match planned_buffer {
+                    Some(buf) => self.wrap_buffer_as_tensor(context, buf, output_shape),
+                    None => TensorInitContext::init(context, output_shape),
+                };
+                let input_tensor = self.wrap_buffer_as_tensor(context, input_buffer, input_shape);
+                let bias_tensor = self.wrap_buffer_as_tensor(context, bias_buffer, bias_shape);
+
+                // Try Metal dispatch for supported matrix types on macOS
+                #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+                {
+                    // Metal Q4K path - use native SIMD operations
+                    if let super::matrix::Matrix::Q4K { w, .. } = matrix {
+                        if let Some(output_buf) = self.execute_metal_q4k_matmul_bias(
+                            context,
+                            w,
+                            &input_tensor,
+                            &bias_tensor,
+                            &output,
+                            activation,
+                        ) {
+                            if let Some(node) = self.get_mut(idx) {
+                                node.buffer = Some(output_buf);
+                            }
+                            return Ok(());
+                        }
+                        // Fall through to WebGPU if Metal fails
+                    }
+
+                    // Metal Int8 path
+                    if let super::matrix::Matrix::Int8 { w, m } = matrix {
+                        if let Some(output_buf) = self.execute_metal_int8_matmul_bias(
+                            context,
+                            w,
+                            m,
+                            &input_tensor,
+                            &bias_tensor,
+                            &output,
+                            activation,
+                        ) {
+                            if let Some(node) = self.get_mut(idx) {
+                                node.buffer = Some(output_buf);
+                            }
+                            return Ok(());
+                        }
+                        // Fall through to WebGPU if Metal fails
+                    }
+                }
+
+                let op = TensorOp::matmul_vec_fp16_bias(
+                    matrix,
+                    &input_tensor,
+                    &bias_tensor,
+                    &output,
+                    activation,
+                    turbo,
+                )?;
+                context.queue.submit(context.encode(&op));
+
+                let output_buffer = output.buffer.clone();
+                if let Some(node) = self.get_mut(idx) {
+                    node.buffer = Some(output_buffer);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1417,6 +1645,218 @@ impl ComputeGraph {
             id: uid::Id::new(),
             phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Execute Int8 matmul+bias using native Metal SIMD operations.
+    /// Returns the output buffer if successful, None if Metal execution failed.
+    #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_metal_int8_matmul_bias(
+        &self,
+        _context: &Context,
+        matrix: &TensorGpu<u8, ReadWrite>,
+        scales: &TensorGpu<f16, ReadWrite>,
+        input: &TensorGpu<f16, ReadWrite>,
+        bias: &TensorGpu<f16, ReadWrite>,
+        output: &TensorGpu<f16, ReadWrite>,
+        activation: Activation,
+    ) -> Option<Arc<Buffer>> {
+        use crate::metal::kernels::{kernel_name_for_activation, MATMUL_INT8_BIAS_SOURCE};
+        use crate::metal::{BufferBridge, MetalContext};
+
+        // Extract Metal buffers from wgpu buffers (zero-copy)
+        let metal_matrix = unsafe { BufferBridge::extract_from_arc(&matrix.buffer)? };
+        let metal_scales = unsafe { BufferBridge::extract_from_arc(&scales.buffer)? };
+        let metal_input = unsafe { BufferBridge::extract_from_arc(&input.buffer)? };
+        let metal_bias = unsafe { BufferBridge::extract_from_arc(&bias.buffer)? };
+        let metal_output = unsafe { BufferBridge::extract_from_arc(&output.buffer)? };
+
+        // Create Metal context and compile shader
+        let mut metal_ctx = MetalContext::new().ok()?;
+        metal_ctx.compile_library(MATMUL_INT8_BIAS_SOURCE).ok()?;
+
+        // Get the appropriate kernel for the activation
+        let kernel_name = kernel_name_for_activation(activation);
+        let pipeline = metal_ctx.get_pipeline(kernel_name).ok()?.clone();
+
+        // Create params buffer
+        let [k, m, _, _] = matrix.shape.into();
+        let [_, t, b, _] = input.shape.into();
+        let params: [u32; 4] = [k as u32, m as u32, t as u32, b as u32];
+        let metal_params =
+            metal_ctx.new_buffer_with_data(&params, metal::MTLResourceOptions::StorageModeShared);
+
+        // Create command buffer and encoder
+        let cmd = metal_ctx.queue().new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&metal_matrix), 0);
+        encoder.set_buffer(1, Some(&metal_scales), 0);
+        encoder.set_buffer(2, Some(&metal_input), 0);
+        encoder.set_buffer(3, Some(&metal_bias), 0);
+        encoder.set_buffer(4, Some(&metal_output), 0);
+        encoder.set_buffer(5, Some(&metal_params), 0);
+
+        // Dispatch threads - one thread per output element
+        let thread_group_size = metal::MTLSize::new(64, 1, 1);
+        let grid_size = metal::MTLSize::new(m as u64, t as u64, b as u64);
+        encoder.dispatch_threads(grid_size, thread_group_size);
+
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        log::debug!(
+            "Metal Int8 matmul+bias executed: {}x{} @ {} tokens",
+            k,
+            m,
+            t
+        );
+
+        // Return the output buffer
+        Some(output.buffer.clone())
+    }
+
+    /// Execute Q4K matmul+bias using native Metal operations.
+    /// Returns the output buffer if successful, None if Metal execution failed.
+    #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_metal_q4k_matmul_bias(
+        &self,
+        _context: &Context,
+        matrix: &TensorGpu<u8, ReadWrite>,
+        input: &TensorGpu<f16, ReadWrite>,
+        bias: &TensorGpu<f16, ReadWrite>,
+        output: &TensorGpu<f16, ReadWrite>,
+        activation: Activation,
+    ) -> Option<Arc<Buffer>> {
+        use crate::metal::kernels::{kernel_name_q4k_for_activation, MATMUL_Q4K_BIAS_SOURCE};
+        use crate::metal::{BufferBridge, MetalContext};
+
+        // Extract Metal buffers from wgpu buffers (zero-copy)
+        let metal_matrix = unsafe { BufferBridge::extract_from_arc(&matrix.buffer)? };
+        let metal_input = unsafe { BufferBridge::extract_from_arc(&input.buffer)? };
+        let metal_bias = unsafe { BufferBridge::extract_from_arc(&bias.buffer)? };
+        let metal_output = unsafe { BufferBridge::extract_from_arc(&output.buffer)? };
+
+        // Create Metal context and compile shader
+        let mut metal_ctx = MetalContext::new().ok()?;
+        metal_ctx.compile_library(MATMUL_Q4K_BIAS_SOURCE).ok()?;
+
+        // Get the appropriate kernel for the activation
+        let kernel_name = kernel_name_q4k_for_activation(activation);
+        let pipeline = metal_ctx.get_pipeline(kernel_name).ok()?.clone();
+
+        // Q4K matrix: raw bytes, 144 bytes per 256 elements (36 u32 per block)
+        // Get K from input shape (input is [K, T, B, 1])
+        // Get M from output shape (output is [M, T, B, 1])
+        let [k, t, b, _] = input.shape.into();
+        let [m, _, _, _] = output.shape.into();
+
+        let params: [u32; 4] = [k as u32, m as u32, t as u32, b as u32];
+        let metal_params =
+            metal_ctx.new_buffer_with_data(&params, metal::MTLResourceOptions::StorageModeShared);
+
+        // Create command buffer and encoder
+        let cmd = metal_ctx.queue().new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&metal_matrix), 0);
+        encoder.set_buffer(1, Some(&metal_input), 0);
+        encoder.set_buffer(2, Some(&metal_bias), 0);
+        encoder.set_buffer(3, Some(&metal_output), 0);
+        encoder.set_buffer(4, Some(&metal_params), 0);
+
+        // Allocate threadgroup memory for reduction (64 threads * 4 floats)
+        encoder.set_threadgroup_memory_length(0, 64 * 4 * 4);
+
+        // Dispatch: each thread group handles 4 output rows
+        let num_groups_m = (m + 3) / 4;
+        let thread_group_size = metal::MTLSize::new(64, 1, 1);
+        let grid_size = metal::MTLSize::new(num_groups_m as u64, t as u64, b as u64);
+        encoder.dispatch_thread_groups(grid_size, thread_group_size);
+
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        log::debug!("Metal Q4K matmul+bias executed: {}x{} @ {} tokens", k, m, t);
+
+        // Return the output buffer
+        Some(output.buffer.clone())
+    }
+
+    /// Execute Q4K matmul (without bias) using native Metal operations.
+    /// Returns the output buffer if successful, None if Metal execution failed.
+    #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+    fn execute_metal_q4k_matmul(
+        &self,
+        _context: &Context,
+        matrix: &TensorGpu<u8, ReadWrite>,
+        input: &TensorGpu<f16, ReadWrite>,
+        output: &TensorGpu<f16, ReadWrite>,
+        activation: Activation,
+    ) -> Option<Arc<Buffer>> {
+        use crate::metal::kernels::{kernel_name_q4k_for_activation, MATMUL_Q4K_BIAS_SOURCE};
+        use crate::metal::{BufferBridge, MetalContext};
+
+        // Extract Metal buffers from wgpu buffers (zero-copy)
+        let metal_matrix = unsafe { BufferBridge::extract_from_arc(&matrix.buffer)? };
+        let metal_input = unsafe { BufferBridge::extract_from_arc(&input.buffer)? };
+        let metal_output = unsafe { BufferBridge::extract_from_arc(&output.buffer)? };
+
+        // Create Metal context and compile shader
+        let mut metal_ctx = MetalContext::new().ok()?;
+        metal_ctx.compile_library(MATMUL_Q4K_BIAS_SOURCE).ok()?;
+
+        // Get the appropriate kernel for the activation
+        let kernel_name = kernel_name_q4k_for_activation(activation);
+        let pipeline = metal_ctx.get_pipeline(kernel_name).ok()?.clone();
+
+        // Get dimensions from tensor shapes
+        use super::TensorShape;
+        let [k, t, b, _] = input.shape().into();
+        let [m, _, _, _] = output.shape().into();
+
+        let params: [u32; 4] = [k as u32, m as u32, t as u32, b as u32];
+        let metal_params =
+            metal_ctx.new_buffer_with_data(&params, metal::MTLResourceOptions::StorageModeShared);
+
+        // Create a zero bias buffer (no bias for this op)
+        let zero_bias: Vec<f16> = vec![f16::from_f32(0.0); m];
+        let metal_bias = metal_ctx
+            .new_buffer_with_data(&zero_bias, metal::MTLResourceOptions::StorageModeShared);
+
+        // Create command buffer and encoder
+        let cmd = metal_ctx.queue().new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&metal_matrix), 0);
+        encoder.set_buffer(1, Some(&metal_input), 0);
+        encoder.set_buffer(2, Some(&metal_bias), 0);
+        encoder.set_buffer(3, Some(&metal_output), 0);
+        encoder.set_buffer(4, Some(&metal_params), 0);
+
+        // Allocate threadgroup memory for reduction (64 threads * 4 floats)
+        encoder.set_threadgroup_memory_length(0, 64 * 4 * 4);
+
+        // Dispatch: each thread group handles 4 output rows
+        let num_groups_m = (m + 3) / 4;
+        let thread_group_size = metal::MTLSize::new(64, 1, 1);
+        let grid_size = metal::MTLSize::new(num_groups_m as u64, t as u64, b as u64);
+        encoder.dispatch_thread_groups(grid_size, thread_group_size);
+
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        log::debug!("Metal Q4K matmul executed: {}x{} @ {} tokens", k, m, t);
+
+        // Return the output buffer
+        Some(output.buffer.clone())
     }
 }
 

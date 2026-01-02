@@ -89,6 +89,10 @@ tokio = { version = "1.41", features = ["full"] }
 name = "debug_gguf"
 path = "debug_gguf.rs"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"
+objc = "0.2"
+
 [features]
 default = ["native"]
 
@@ -104,3 +108,5 @@ tokio = ["dep:tokio"]
 trace = ["tracing", "tracing-subscriber", "tracing-tracy"]
 ## Enables backtrace for errors.
 backtrace = []
+## Enables native Metal backend for accelerated Int8 operations on macOS.
+metal-acceleration = []

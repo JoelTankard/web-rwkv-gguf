@@ -38,6 +38,46 @@ impl<T: LazyDataType> LazyTensor<T> {
         LazyTensor::new(self.context().clone(), info, key)
     }
 
+    /// Lazy fused matrix multiplication with bias addition.
+    ///
+    /// Creates a graph node for `activation(matmul(matrix, self) + bias)`.
+    /// This is more efficient than separate matmul and add operations.
+    /// - `matrix`: The weight matrix to multiply with.
+    /// - `bias`: Bias tensor to add after multiplication (shape: `[R, 1, 1, 1]`).
+    /// - `activation`: Activation function to apply after bias addition.
+    /// - `turbo`: Whether to use turbo mode (batch optimization).
+    ///
+    /// Returns a new lazy tensor representing the output.
+    pub fn matmul_bias(
+        &self,
+        matrix: &Matrix,
+        bias: &LazyTensor<T>,
+        activation: Activation,
+        turbo: bool,
+    ) -> LazyTensor<T> {
+        let output_shape = compute_matmul_output_shape(self.shape(), matrix);
+        let info = TensorInfo {
+            shape: output_shape,
+            dtype: T::lazy_dtype(),
+        };
+
+        let node = ComputeNode {
+            operation: LazyOp::MatMulBias {
+                matrix: MatrixRef::from_ref(matrix),
+                input: self.key(),
+                bias: bias.key(),
+                activation,
+                turbo,
+            },
+            info: info.clone(),
+            ref_count: 1,
+            buffer: None,
+        };
+
+        let key = self.context().graph().add_node(node);
+        LazyTensor::new(self.context().clone(), info, key)
+    }
+
     /// Lazy element-wise addition.
     ///
     /// Creates a graph node for `self + other`.

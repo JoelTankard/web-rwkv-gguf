@@ -7,8 +7,8 @@ use half::f16;
 use web_rwkv::{
     context::{Context, ContextBuilder, InstanceExt},
     tensor::{
-        kind::ReadWrite, lazy_tensor::LazyTensor, shape::Shape, TensorCpu, TensorGpu, TensorInit,
-        TensorInto,
+        kind::ReadWrite, lazy_tensor::LazyTensor, matrix::Matrix, ops::Activation, shape::Shape,
+        TensorCpu, TensorGpu, TensorInit, TensorInto,
     },
 };
 
@@ -49,6 +49,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Test 8: Blend operation
     test_lazy_blend(&context).await?;
+
+    // Test 9: MatMul + Bias fusion
+    test_matmul_bias_fusion(&context).await?;
+
+    // Test 10: Explicit matmul_bias operation
+    test_explicit_matmul_bias(&context).await?;
 
     log::info!("All lazy tensor tests passed!");
     Ok(())
@@ -285,5 +291,107 @@ async fn test_lazy_blend(context: &Context) -> anyhow::Result<()> {
     let _buffer = lazy_blended.materialize()?;
 
     log::info!("  ✓ Lazy blend operation passed");
+    Ok(())
+}
+
+async fn test_matmul_bias_fusion(context: &Context) -> anyhow::Result<()> {
+    log::info!("Test 9: MatMul + Bias fusion (automatic)");
+
+    // Create a simple FP16 matrix [K=64, M=32, B=1]
+    let k = 64;
+    let m = 32;
+    let t = 4; // tokens
+
+    // Matrix weights
+    let matrix_shape = Shape::new(k, m, 1, 1);
+    let matrix_data: Vec<f16> = (0..matrix_shape.len())
+        .map(|i| f16::from_f32((i as f32 * 0.01) - 0.5))
+        .collect();
+    let cpu_matrix: TensorCpu<f16> = TensorInit::from_data(matrix_shape, matrix_data)?;
+    let gpu_matrix: TensorGpu<f16, ReadWrite> = cpu_matrix.to(context);
+    let matrix = Matrix::Fp16(gpu_matrix);
+
+    // Input tensor [K, T, B]
+    let input_shape = Shape::new(k, t, 1, 1);
+    let input_data: Vec<f16> = (0..input_shape.len())
+        .map(|i| f16::from_f32(i as f32 * 0.1))
+        .collect();
+    let cpu_input: TensorCpu<f16> = TensorInit::from_data(input_shape, input_data)?;
+    let gpu_input: TensorGpu<f16, ReadWrite> = cpu_input.to(context);
+
+    // Bias tensor [M, 1, 1] - will be broadcast
+    let bias_shape = Shape::new(m, 1, 1, 1);
+    let bias_data: Vec<f16> = (0..bias_shape.len())
+        .map(|i| f16::from_f32(i as f32 * 0.05))
+        .collect();
+    let cpu_bias: TensorCpu<f16> = TensorInit::from_data(bias_shape, bias_data)?;
+    let gpu_bias: TensorGpu<f16, ReadWrite> = cpu_bias.to(context);
+
+    // Create lazy tensors
+    let lazy_input = LazyTensor::from_gpu(&gpu_input);
+    let lazy_bias = LazyTensor::from_gpu(&gpu_bias);
+
+    // Build graph: matmul(input, matrix) + bias
+    // This pattern should be detected and fused by the optimizer
+    let lazy_matmul = lazy_input.matmul(&matrix, Activation::None, false);
+    let lazy_result = lazy_matmul.add(&lazy_bias);
+
+    // Check graph stats before materialization
+    let graph = context.graph();
+    let nodes_before = graph.len();
+    drop(graph);
+
+    // Materialize - this triggers optimization
+    let _buffer = lazy_result.materialize()?;
+
+    log::info!("  Graph had {} nodes before optimization", nodes_before);
+    log::info!("  ✓ MatMul + Bias fusion test passed");
+    Ok(())
+}
+
+async fn test_explicit_matmul_bias(context: &Context) -> anyhow::Result<()> {
+    log::info!("Test 10: Explicit matmul_bias operation");
+
+    // Create a simple FP16 matrix [K=64, M=32, B=1]
+    let k = 64;
+    let m = 32;
+    let t = 4; // tokens
+
+    // Matrix weights
+    let matrix_shape = Shape::new(k, m, 1, 1);
+    let matrix_data: Vec<f16> = (0..matrix_shape.len())
+        .map(|i| f16::from_f32((i as f32 * 0.01) - 0.5))
+        .collect();
+    let cpu_matrix: TensorCpu<f16> = TensorInit::from_data(matrix_shape, matrix_data)?;
+    let gpu_matrix: TensorGpu<f16, ReadWrite> = cpu_matrix.to(context);
+    let matrix = Matrix::Fp16(gpu_matrix);
+
+    // Input tensor [K, T, B]
+    let input_shape = Shape::new(k, t, 1, 1);
+    let input_data: Vec<f16> = (0..input_shape.len())
+        .map(|i| f16::from_f32(i as f32 * 0.1))
+        .collect();
+    let cpu_input: TensorCpu<f16> = TensorInit::from_data(input_shape, input_data)?;
+    let gpu_input: TensorGpu<f16, ReadWrite> = cpu_input.to(context);
+
+    // Bias tensor [M, 1, 1] - will be broadcast
+    let bias_shape = Shape::new(m, 1, 1, 1);
+    let bias_data: Vec<f16> = (0..bias_shape.len())
+        .map(|i| f16::from_f32(i as f32 * 0.05))
+        .collect();
+    let cpu_bias: TensorCpu<f16> = TensorInit::from_data(bias_shape, bias_data)?;
+    let gpu_bias: TensorGpu<f16, ReadWrite> = cpu_bias.to(context);
+
+    // Create lazy tensors
+    let lazy_input = LazyTensor::from_gpu(&gpu_input);
+    let lazy_bias = LazyTensor::from_gpu(&gpu_bias);
+
+    // Use explicit matmul_bias - directly creates fused operation
+    let lazy_result = lazy_input.matmul_bias(&matrix, &lazy_bias, Activation::None, false);
+
+    // Materialize
+    let _buffer = lazy_result.materialize()?;
+
+    log::info!("  ✓ Explicit matmul_bias operation passed");
     Ok(())
 }

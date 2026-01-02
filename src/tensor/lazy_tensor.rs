@@ -83,6 +83,32 @@ impl<T: LazyDataType> LazyTensor<T> {
         }
     }
 
+    /// Create a lazy tensor from a GPU tensor of any Float type.
+    /// This wraps the tensor as an Input node, treating it as f16 internally.
+    pub fn from_gpu_generic<F: crate::num::Float>(tensor: &TensorGpu<F, ReadWrite>) -> Self {
+        let context = tensor.context().clone();
+        let shape = tensor.shape();
+        let dtype = T::lazy_dtype();
+
+        let node = ComputeNode {
+            operation: LazyOp::Input {
+                buffer: tensor.buffer.clone(),
+            },
+            info: TensorInfo { shape, dtype },
+            ref_count: 1,
+            buffer: Some(tensor.buffer.clone()),
+        };
+
+        let key = context.graph().add_node(node);
+
+        Self {
+            context,
+            info: TensorInfo { shape, dtype },
+            key,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Get the shape of this tensor without materializing.
     pub fn shape(&self) -> Shape {
         self.info.shape

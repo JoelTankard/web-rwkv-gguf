@@ -131,6 +131,12 @@ impl crate::context::Context {
                     std::mem::swap(&mut temp, passes);
                     commands.push(temp);
                 }
+                #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+                TensorOp::MetalV7Layer { execute } => {
+                    // Execute Metal layer immediately during encoding
+                    // This runs the entire layer with a single Metal sync
+                    let _ = execute();
+                }
             }
         }
 
@@ -319,6 +325,13 @@ pub enum TensorOp {
     },
     List(Vec<TensorOp>),
     Sep,
+    /// Metal V7 layer execution (macOS only).
+    /// Executes an entire V7 layer using Metal with a single sync point.
+    #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+    MetalV7Layer {
+        /// Closure that executes the Metal layer. Returns true if successful.
+        execute: Arc<dyn Fn() -> bool + Send + Sync>,
+    },
 }
 
 impl TensorOp {
@@ -814,6 +827,91 @@ impl TensorOp {
             pipeline,
             bindings,
             dispatch: [matrix.shape[1] as u32 / 4, shape[1] as u32, shape[2] as u32],
+        })
+    }
+
+    /// Fused FP16 matrix-vector multiplication with bias addition.
+    /// Computes: output = activation(matrix @ input + bias)
+    /// - `matrix` shape: `[C, R, B]`.
+    /// - `input` shape: `[C, T, B]`.
+    /// - `bias` shape: `[R, 1, 1]` - bias vector broadcast across tokens and batches.
+    /// - `output` shape: `[R, T, B]`.
+    pub fn matmul_vec_fp16_bias<'a, 'b, 'c, F0: Float, F1: Float>(
+        matrix: &super::matrix::Matrix,
+        input: impl Into<TensorGpuView<'a, F0>>,
+        bias: impl Into<TensorGpuView<'b, f16>>,
+        output: impl Into<TensorGpuView<'c, F1>>,
+        act: Activation,
+        _turbo: bool,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let input: TensorGpuView<_> = input.into();
+        let bias: TensorGpuView<_> = bias.into();
+        let output: TensorGpuView<_> = output.into();
+
+        // For now, only support Fp16 matrices for fused bias
+        let matrix_tensor = match matrix {
+            super::matrix::Matrix::Fp16(m) => m,
+            _ => {
+                // Fall back to separate matmul + add for non-Fp16 matrices
+                return Err(TensorError::from(TensorErrorKind::Deduce));
+            }
+        };
+
+        let context = output.context();
+        let shape = {
+            let [m, n, b, _] = output.shape().into();
+            let [k, _, _, _] = input.shape().into();
+            matrix_tensor.check_shape([k, m, b, 1])?;
+            input.check_shape([k, n, b, 1])?;
+            output.check_shape([m, n, b, 1])?;
+            // Bias should be [R, 1, 1, 1] or broadcastable
+            output.shape()
+        };
+
+        let key = PipelineKey::new(
+            "matmul_vec_fp16_bias",
+            "matmul",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&input, Some("IN"))
+                .tensor(&output, Some("OUT"))
+                .activate("ACT", act),
+        );
+
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/matmul_vec_fp16_bias.wgsl"),
+            &[
+                matrix_tensor.meta_layout(0),
+                input.meta_layout(1),
+                output.meta_layout(2),
+                matrix_tensor.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+                bias.layout(6, true),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, matrix_tensor)
+            .bind_meta(1, &input)
+            .bind_meta(2, &output)
+            .bind(3, matrix_tensor)
+            .bind(4, &input)
+            .bind(5, &output)
+            .bind(6, &bias)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                matrix_tensor.shape[1] as u32 / 4,
+                shape[1] as u32,
+                shape[2] as u32,
+            ],
         })
     }
 
