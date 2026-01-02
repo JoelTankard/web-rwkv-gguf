@@ -592,7 +592,7 @@ impl<F: Float> super::model::Bundle for Bundle<F> {
 }
 
 fn turbo(num_token: usize) -> bool {
-    num_token.is_multiple_of(super::infer::rnn::MIN_TOKEN_CHUNK_SIZE)
+    num_token > 64
 }
 
 fn hook_op<F: Float>(

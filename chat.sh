@@ -5,7 +5,7 @@
 set -e
 
 # Default values
-MODEL="assets/models/rwkv7-g1b-2.9b-20251205-ctx8192-Q4_K_M.gguf"
+MODEL="assets/models/2.9b-Q4_K_M.gguf"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do

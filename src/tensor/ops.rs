@@ -3,11 +3,15 @@ use std::{hash::Hash, sync::Arc};
 use embed_doc_image::embed_doc_image;
 use half::f16;
 use serde::{Deserialize, Serialize};
-use wgpu::{BindGroup, CommandBuffer, CommandEncoder, ComputePass};
+use wgpu::{
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutEntry, BindingType,
+    BufferBindingType, CommandBuffer, CommandEncoder, ComputePass, ShaderStages,
+};
 
 use super::{
     kind::{Kind, ReadWrite, Uniform},
-    Shape, TensorError, TensorErrorKind, TensorGpu, TensorGpuView, TensorScalar, TensorShape,
+    Shape, TensorError, TensorErrorKind, TensorGpu, TensorGpuView, TensorResource, TensorScalar,
+    TensorShape,
 };
 use crate::{
     context::{BindGroupBuilder, CachedPipeline, Macros, PipelineKey},
@@ -2245,6 +2249,137 @@ impl TensorOp {
         })
     }
 
+    /// Cursor-free token shift for lazy evaluation.
+    ///
+    /// Unlike `token_shift`, this variant doesn't use cursor-based indexing.
+    /// Instead, it operates on explicit tensors with shape [C, T, B]:
+    /// - `mix`: Mixing coefficients [C, T, 1] or [C, 1, 1]
+    /// - `state`: Previous state [C, 1, B]
+    /// - `input`: Current input [C, T, B]
+    /// - `output`: Output [C, T, B]
+    ///
+    /// For token 0, mixes with state; for token > 0, mixes with previous token.
+    pub fn token_shift_lazy<'a, 'b, F: Float>(
+        mix: impl Into<TensorGpuView<'a, F>>,
+        state: impl Into<TensorGpuView<'b, f32>>,
+        input: &TensorGpu<F, ReadWrite>,
+        output: &TensorGpu<F, ReadWrite>,
+        reversed: bool,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let mix: TensorGpuView<_> = mix.into();
+        let state: TensorGpuView<_> = state.into();
+
+        let context = output.context();
+        let shape = output.shape();
+        let [c, t, b, _] = shape.into();
+
+        input.check_shape(shape)?;
+        mix.check_shape_any(&[[c, t, 1, 1], [c, 1, 1, 1]])?;
+        state.check_shape([c, 1, b, 1])?;
+
+        let key = PipelineKey::new(
+            "token_shift_lazy",
+            "token_shift_lazy",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(&mix, Some("MIX"))
+                .tensor(input, Some("IN"))
+                .tensor(output, Some("OUT"))
+                .bool("REVERSED", reversed),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/token_shift_lazy.wgsl"),
+            &[
+                output.meta_layout(0),
+                mix.meta_layout(1),
+                mix.layout(2, true),
+                state.layout(3, true),
+                input.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, output)
+            .bind_meta(1, &mix)
+            .bind(2, &mix)
+            .bind(3, &state)
+            .bind(4, input)
+            .bind(5, output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [u32::div_ceil(c as u32 / 4, BLOCK_SIZE), t as u32, b as u32],
+        })
+    }
+
+    /// Tensor-based blend for lazy evaluation: lhs * factor + rhs * (1 - factor).
+    ///
+    /// Unlike `blend`, this variant uses a tensor for the factor instead of a scalar.
+    /// - `lhs`: First input tensor [C, T, B]
+    /// - `rhs`: Second input tensor [C, T, B]
+    /// - `factor`: Blending factor tensor [C, T?, B?] (broadcasts if dimensions are 1)
+    /// - `output`: Output tensor [C, T, B]
+    pub fn blend_tensor<'a, F: Float>(
+        lhs: &TensorGpu<F, ReadWrite>,
+        rhs: &TensorGpu<F, ReadWrite>,
+        factor: impl Into<TensorGpuView<'a, F>>,
+        output: &TensorGpu<F, ReadWrite>,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let factor: TensorGpuView<_> = factor.into();
+
+        let context = output.context();
+        let shape = output.shape();
+        let [c, t, b, _] = shape.into();
+
+        lhs.check_shape(shape)?;
+        rhs.check_shape(shape)?;
+
+        let key = PipelineKey::new(
+            "blend_tensor",
+            "blend_tensor",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(lhs, Some("IN"))
+                .tensor(&factor, Some("FACTOR"))
+                .tensor(output, Some("OUT")),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/blend_tensor.wgsl"),
+            &[
+                output.meta_layout(0),
+                factor.meta_layout(1),
+                lhs.layout(2, true),
+                rhs.layout(3, true),
+                factor.layout(4, true),
+                output.layout(5, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, output)
+            .bind_meta(1, &factor)
+            .bind(2, lhs)
+            .bind(3, rhs)
+            .bind(4, &factor)
+            .bind(5, output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [u32::div_ceil(c as u32 / 4, BLOCK_SIZE), t as u32, b as u32],
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn time_mix_v4<'a, T: Float>(
         cursors: &TensorGpu<u32, ReadWrite>,
@@ -2577,6 +2712,263 @@ impl TensorOp {
             dispatch: [
                 u32::div_ceil(stride as u32 / 4, BLOCK_SIZE),
                 shape[2] as u32,
+                1,
+            ],
+        })
+    }
+
+    /// Cursor-free V7 time mix operation for lazy evaluation.
+    /// Takes explicit batch index instead of reading from cursor array.
+    pub fn time_mix_v7_lazy<'a, T: Float>(
+        state: impl Into<TensorGpuView<'a, f32>>,
+        r: &TensorGpu<T, ReadWrite>,
+        w: &TensorGpu<T, ReadWrite>,
+        n: &TensorGpu<T, ReadWrite>,
+        x: &TensorGpu<T, ReadWrite>,
+        batch_index: u32,
+        num_tokens: u32,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 32;
+
+        let state: TensorGpuView<_> = state.into();
+
+        let context = x.context();
+        let shape = x.shape();
+        let stride = shape[0] * shape[1];
+
+        r.check_shape(shape)?;
+        w.check_shape(shape)?;
+        n.check_shape([shape[0], shape[1], shape[2], 4])?;
+        state.check_shape([stride, shape[0] + 1, state.shape()[2], 1])?;
+
+        let batch_info = context
+            .checkout_shape_uniform([batch_index as usize, 0, num_tokens as usize, 0].into());
+
+        let batch_info_layout = BindGroupLayoutEntry {
+            binding: 2,
+            visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+
+        let key = PipelineKey::new(
+            "time_mix_v7_lazy",
+            "time_mix",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .u32("HEAD_SIZE", shape[0] as u32 / 4)
+                .tensor(x, None),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/time_mix_v7_lazy.wgsl"),
+            &[
+                x.meta_layout(0),
+                state.meta_layout(1),
+                batch_info_layout,
+                state.layout(3, false),
+                r.layout(5, true),
+                w.layout(6, true),
+                n.layout(7, true),
+                x.layout(9, false),
+            ],
+        );
+
+        let bindings = vec![context
+            .device
+            .create_bind_group(&BindGroupDescriptor {
+                label: Some("time_mix_v7_lazy"),
+                layout: &pipeline.layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: x.meta_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: state.meta_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: batch_info.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: state.binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 5,
+                        resource: r.binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 6,
+                        resource: w.binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 7,
+                        resource: n.binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 9,
+                        resource: x.binding(),
+                    },
+                ],
+            })
+            .into()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [u32::div_ceil(stride as u32 / 4, BLOCK_SIZE), 1, 1],
+        })
+    }
+
+    /// Cursor-free V7 time first operation for lazy evaluation.
+    pub fn time_first_v7_lazy<T: Float>(
+        r: &TensorGpu<T, ReadWrite>,
+        n: &TensorGpu<T, ReadWrite>,
+        x: &TensorGpu<T, ReadWrite>,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 32;
+
+        let context = x.context();
+        let shape = x.shape();
+        let stride = shape[0] * shape[1];
+
+        r.check_shape(shape)?;
+        n.check_shape([shape[0], shape[1], shape[2], 4])?;
+
+        let key = PipelineKey::new(
+            "time_first_v7_lazy",
+            "time_first",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .u32("HEAD_SIZE", shape[0] as u32 / 4)
+                .tensor(x, None),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/time_mix_v7_lazy.wgsl"),
+            &[
+                x.meta_layout(0),
+                r.layout(5, true),
+                n.layout(7, true),
+                x.layout(9, false),
+            ],
+        );
+
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, x)
+            .bind(5, r)
+            .bind(7, n)
+            .bind(9, x)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                u32::div_ceil(stride as u32 / 4, BLOCK_SIZE),
+                shape[2] as u32,
+                1,
+            ],
+        })
+    }
+
+    /// Cursor-free V7 channel mix operation for lazy evaluation.
+    /// Takes explicit batch index instead of reading from cursor array.
+    pub fn channel_mix_v7_lazy<'a, T: Float>(
+        state: impl Into<TensorGpuView<'a, f32>>,
+        v: &TensorGpu<T, ReadWrite>,
+        x: &TensorGpu<T, ReadWrite>,
+        batch_index: u32,
+        num_tokens: u32,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let state: TensorGpuView<_> = state.into();
+
+        let context = x.context();
+        let shape = x.shape();
+        v.check_shape(shape)?;
+        state.check_shape([shape[0], 1, state.shape()[2], 1])?;
+
+        let batch_info = context
+            .checkout_shape_uniform([batch_index as usize, 0, num_tokens as usize, 0].into());
+
+        let batch_info_layout = BindGroupLayoutEntry {
+            binding: 2,
+            visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+
+        let key = PipelineKey::new(
+            "channel_mix_v7_lazy",
+            "channel_mix",
+            Macros::new().u32("BLOCK_SIZE", BLOCK_SIZE).tensor(x, None),
+        );
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/channel_mix_v7_lazy.wgsl"),
+            &[
+                x.meta_layout(0),
+                state.meta_layout(1),
+                batch_info_layout,
+                state.layout(3, false),
+                v.layout(5, true),
+                x.layout(6, false),
+            ],
+        );
+
+        let bindings = vec![context
+            .device
+            .create_bind_group(&BindGroupDescriptor {
+                label: Some("channel_mix_v7_lazy"),
+                layout: &pipeline.layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: x.meta_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: state.meta_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: batch_info.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: state.binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 5,
+                        resource: v.binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 6,
+                        resource: x.binding(),
+                    },
+                ],
+            })
+            .into()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [
+                u32::div_ceil(shape[0] as u32 / 4, BLOCK_SIZE),
+                shape[1] as u32,
                 1,
             ],
         })

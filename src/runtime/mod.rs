@@ -8,6 +8,7 @@ use thiserror::Error;
 
 pub mod gguf;
 pub mod infer;
+pub mod lazy_runtime;
 pub mod loader;
 pub mod model;
 pub mod softmax;

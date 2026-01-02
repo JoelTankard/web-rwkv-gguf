@@ -9,14 +9,16 @@ use wgpu::{
     Adapter, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
     BindGroupLayoutDescriptor, BindGroupLayoutEntry, Buffer, BufferDescriptor, BufferUsages,
     ComputePipeline, ComputePipelineDescriptor, Device, DeviceDescriptor, ExperimentalFeatures,
-    Features, Instance, Limits, MemoryHints, PipelineLayoutDescriptor, PowerPreference, Queue,
-    RequestAdapterOptions, ShaderModuleDescriptor, Trace,
+    Features, Instance, Limits, MemoryHints, PipelineCache, PipelineCacheDescriptor,
+    PipelineLayoutDescriptor, PowerPreference, Queue, RequestAdapterOptions,
+    ShaderModuleDescriptor, Trace,
 };
 
 use crate::{
     profiler::GpuProfiler,
     tensor::{
         cache::{ResourceCache, SharedResourceCache},
+        graph::ComputeGraph,
         shape::{IntoBytes, Shape},
         ResourceKey, TensorResource, View,
     },
@@ -58,6 +60,7 @@ pub struct Context {
     pub queue: Queue,
     pub profiler: GpuProfiler,
 
+    pipeline_cache: Option<PipelineCache>,
     pipelines: SharedResourceCache<PipelineKey, CachedPipeline>,
     shapes: ResourceCache<View, Buffer>,
     buffers: ResourceCache<BufferKey, Buffer>,
@@ -65,12 +68,18 @@ pub struct Context {
 
     #[cfg(not(target_arch = "wasm32"))]
     event: flume::Sender<ContextEvent>,
+
+    /// Compute graph for lazy tensor evaluation.
+    graph: Arc<std::sync::RwLock<ComputeGraph>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for Context {
     fn drop(&mut self) {
         if self.event.sender_count() <= 1 {
+            // Save pipeline cache to disk before dropping
+            self.save_pipeline_cache();
+
             self.clear_buffers();
             self.queue.submit(None);
             _ = self.device.poll(wgpu::PollType::Wait {
@@ -144,18 +153,47 @@ impl ContextBuilder {
 
         let profiler = GpuProfiler::new(&device, &queue);
 
+        // Create pipeline cache with disk persistence (native only)
+        #[cfg(not(target_arch = "wasm32"))]
+        let pipeline_cache = {
+            let cache_dir = std::env::temp_dir().join("web-rwkv-pipeline-cache");
+            let _ = std::fs::create_dir_all(&cache_dir);
+
+            // pipeline_cache_key returns Option<String>, handle None case
+            match wgpu::util::pipeline_cache_key(&adapter.get_info()) {
+                Some(cache_key) => {
+                    let cache_path = cache_dir.join(&cache_key);
+                    let cache_data = std::fs::read(&cache_path).ok();
+
+                    let cache = unsafe {
+                        device.create_pipeline_cache(&PipelineCacheDescriptor {
+                            label: Some("web-rwkv pipeline cache"),
+                            data: cache_data.as_deref(),
+                            fallback: true,
+                        })
+                    };
+                    Some(cache)
+                }
+                None => None,
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let pipeline_cache = None;
+
         let context = Context {
             id: uid::Id::new(),
             adapter,
             device,
             queue,
             profiler,
+            pipeline_cache,
             pipelines: Default::default(),
             shapes: Default::default(),
-            buffers: ResourceCache::new(4),
+            buffers: ResourceCache::new(128),
             bindings: SharedResourceCache::new(64),
             #[cfg(not(target_arch = "wasm32"))]
             event,
+            graph: Arc::new(std::sync::RwLock::new(ComputeGraph::new())),
         };
 
         // start a thread for reading back buffers
@@ -347,7 +385,7 @@ impl Context {
                     module,
                     entry_point: Some(&key.entry_point),
                     compilation_options: Default::default(),
-                    cache: None,
+                    cache: self.pipeline_cache.as_ref(),
                 });
             CachedPipeline { pipeline, layout }
         })
@@ -379,18 +417,11 @@ impl Context {
     }
 
     pub(crate) fn checkout_buffer_init(&self, contents: &[u8], usage: BufferUsages) -> Arc<Buffer> {
-        let size = std::mem::size_of_val(contents);
-        let _key = BufferKey { size, usage };
         let desc = BufferInitDescriptor {
             label: None,
             contents,
             usage,
         };
-        // self.buffer_cache.checkout(
-        //     key,
-        //     || self.device.create_buffer_init(&desc),
-        //     |buffer| self.queue.write_buffer(buffer, 0, contents),
-        // )
         self.device.create_buffer_init(&desc).into()
     }
 
@@ -452,6 +483,32 @@ impl Context {
     pub fn supports_shader_f16(&self) -> bool {
         self.device.features().contains(Features::SHADER_F16)
     }
+
+    /// Get a mutable reference to the compute graph for lazy tensor evaluation.
+    pub fn graph(&self) -> impl std::ops::DerefMut<Target = ComputeGraph> + '_ {
+        self.graph.write().unwrap()
+    }
+
+    /// Save the pipeline cache to disk for faster startup on subsequent runs.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_pipeline_cache(&self) {
+        if let Some(ref cache) = self.pipeline_cache {
+            if let Some(cache_key) = wgpu::util::pipeline_cache_key(&self.adapter.get_info()) {
+                let cache_dir = std::env::temp_dir().join("web-rwkv-pipeline-cache");
+                let cache_path = cache_dir.join(&cache_key);
+                if let Some(data) = cache.get_data() {
+                    if let Err(e) = std::fs::write(&cache_path, &data) {
+                        log::warn!("Failed to save pipeline cache: {}", e);
+                    } else {
+                        log::debug!("Saved pipeline cache to {:?}", cache_path);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn save_pipeline_cache(&self) {}
 }
 
 #[cfg(not(target_arch = "wasm32"))]

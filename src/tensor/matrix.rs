@@ -131,6 +131,24 @@ pub enum Matrix {
 }
 
 impl Matrix {
+    /// Get the logical shape of the matrix [K, M, B, 1].
+    /// K is the input dimension, M is the output dimension.
+    pub fn shape(&self) -> Shape {
+        match self {
+            Matrix::Fp16(w) => w.shape(),
+            Matrix::Int8 { w, .. } => w.shape(),
+            Matrix::Fp4 { w, .. } => {
+                // NF4 stores half the elements (2 values per byte)
+                let shape = w.shape();
+                Shape::new(shape[0] * 2, shape[1], shape[2], shape[3])
+            }
+            Matrix::Q4K { s, .. } => s.shape(),
+            Matrix::Q5K { s, .. } => s.shape(),
+            Matrix::Q6K { s, .. } => s.shape(),
+            Matrix::Q8_0 { s, .. } => s.shape(),
+        }
+    }
+
     pub fn matmul_vec_op<'a, 'b, F0: Float, F1: Float>(
         &self,
         input: impl Into<TensorGpuView<'a, F0>>,

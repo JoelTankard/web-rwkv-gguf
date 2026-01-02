@@ -4,7 +4,8 @@ use web_rwkv::runtime::gguf::GgufReader;
 use web_rwkv::runtime::loader::Reader;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open("/Users/joel/Dev/Experimental/web-rwkv-gguf/assets/models/rwkv7-g1a-0.1b-20250728-ctx4096.f16.gguf")?;
+    let file =
+        File::open("/Users/joel/Dev/Experimental/web-rwkv-gguf/assets/models/0.1b-Q4_K_M.gguf")?;
     let data = unsafe { Mmap::map(&file)? };
 
     let reader = GgufReader::new(&data)?;

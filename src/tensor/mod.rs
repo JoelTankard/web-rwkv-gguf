@@ -18,7 +18,10 @@ use crate::{
 };
 
 pub mod cache;
+pub mod graph;
 pub mod lazy;
+pub mod lazy_ops;
+pub mod lazy_tensor;
 pub mod matrix;
 pub mod ops;
 pub mod serialization;
