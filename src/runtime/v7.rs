@@ -748,6 +748,14 @@ fn try_metal_v7_layer<F: Float>(
     let att_state = state.att(index).ok()?;
     let ffn_state = state.ffn(index).ok()?;
 
+    // CRITICAL: Sync wgpu before Metal reads from shared buffers
+    // Without this, Metal may read stale data from buffers with pending wgpu writes
+    let submission_index = Some(context.queue.submit(std::iter::empty()));
+    let _ = context.device.poll(wgpu::PollType::Wait {
+        submission_index,
+        timeout: None,
+    });
+
     // Execute entire layer via Metal with single sync point
     let metal_success = crate::metal::v7_layer::execute_metal_v7_layer(
         &context,
@@ -813,7 +821,12 @@ fn dispatch_layer<F: Float>(
     rescale: usize,
 ) -> Result<TensorOp, TensorError> {
     // Try pure Metal V7 layer execution (macOS only, metal-acceleration feature)
-    #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+    // TEMPORARILY DISABLED for debugging - force WebGPU path
+    #[cfg(all(
+        target_os = "macos",
+        feature = "metal-acceleration",
+        feature = "DISABLED"
+    ))]
     if let Some(op) = try_metal_v7_layer(&frame, &layer, index, num_token, head_size, rescale) {
         return op;
     }

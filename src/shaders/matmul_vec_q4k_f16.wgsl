@@ -56,7 +56,9 @@ fn unpack4x16float(x: vec2<u32>) -> vec4<f32> {
 
 #ifdef SHADER_F16
 fn unpack4x16half(x: vec2<u32>) -> vec4<f16> {
-    return vec4<f16>(unpack2x16float(x.x), unpack2x16float(x.y));
+    let lo = unpack2x16float(x.x);
+    let hi = unpack2x16float(x.y);
+    return vec4<f16>(f16(lo.x), f16(lo.y), f16(hi.x), f16(hi.y));
 }
 #endif
 

@@ -847,20 +847,23 @@ impl<R: Reader> Loader<R> {
                     return Ok(None); // Fall back to F16 path
                 }
 
-                // Transpose Q4K layout for coalesced memory access
-                // Original: block[row][sb_k] - row-major, threads reading different rows access far-apart memory
-                // Transposed: block[sb_k][row] - consecutive threads read consecutive super-blocks
-                let k = shape[0]; // K dimension (input features)
-                let m = shape[1]; // M dimension (output features/rows)
-                let num_sb_k = k / 256; // Number of super-blocks along K
-                let transposed = transpose_q4k_layout(raw_data, m, num_sb_k);
+                // Non-transposed layout - use raw data directly
+                // The non-transposed shader (matmul_vec_q4k.wgsl) expects row-major layout
+                //
+                // GGUF stores matrices as [out_features, in_features] = [M, K]
+                // self.model.shape() returns [M, K] (raw GGUF order)
+                // tensor_shape() calls from_slice_rev([M, K]) -> Shape::new(K, M, 1, 1)
+                // So: shape[0] = K, shape[1] = M
+                //
+                // Shader expects va.shape = [K, M, B] where va.shape.x = K, va.shape.y = M
+                // Shape::new(K, M, 1, 1) maps to va.shape.x = K, va.shape.y = M ✓
 
-                // Create GPU tensor with transposed Q4_K block data
-                let block_data_shape = Shape::new(transposed.len(), 1, 1, 1);
+                // Create GPU tensor with raw Q4_K block data (no transpose)
+                let block_data_shape = Shape::new(raw_data.len(), 1, 1, 1);
                 let w: TensorGpu<u8, ReadWrite> =
-                    TensorGpu::from_data_u8(context, block_data_shape, &transposed)?;
+                    TensorGpu::from_data_u8(context, block_data_shape, raw_data)?;
 
-                // Create a dummy tensor with the logical matrix shape for metadata
+                // shape is already [K, M, 1, 1] which matches shader expectation
                 let s: TensorGpu<u8, ReadWrite> = context.tensor_init(shape);
 
                 Ok(Some(Matrix::Q4K { w, s }))

@@ -905,16 +905,170 @@ fn execute_metal_v7_layer_inner<'a, F: Float>(
     Some(true)
 }
 
-// Helper functions to extract Q4K matrix data
-fn extract_q4k_matrix(matrix: &Matrix) -> Option<(MetalBuffer, usize, usize)> {
+/// Extracted matrix data for Metal execution
+enum ExtractedMatrix {
+    Q4K {
+        w: MetalBuffer,
+        k: usize,
+        m: usize,
+    },
+    Int8 {
+        w: MetalBuffer,
+        minmax: MetalBuffer,
+        k: usize,
+        m: usize,
+    },
+    Fp16 {
+        w: MetalBuffer,
+        k: usize,
+        m: usize,
+    },
+}
+
+fn extract_matrix(matrix: &Matrix) -> Option<ExtractedMatrix> {
     match matrix {
         Matrix::Q4K { w, s } => {
             let metal_buf = unsafe { BufferBridge::extract_from_arc(&w.buffer)? };
-            let [m, k, _, _] = s.shape().into();
-            Some((metal_buf, k, m))
+            let [k, m, _, _] = s.shape().into();
+            Some(ExtractedMatrix::Q4K { w: metal_buf, k, m })
+        }
+        Matrix::Int8 { w, m: minmax } => {
+            let metal_w = unsafe { BufferBridge::extract_from_arc(&w.buffer)? };
+            let metal_mm = unsafe { BufferBridge::extract_from_arc(&minmax.buffer)? };
+            let [k, m_dim, _, _] = w.shape().into();
+            Some(ExtractedMatrix::Int8 {
+                w: metal_w,
+                minmax: metal_mm,
+                k,
+                m: m_dim,
+            })
+        }
+        Matrix::Fp16(w) => {
+            let metal_buf = unsafe { BufferBridge::extract_from_arc(&w.buffer)? };
+            let [k, m, _, _] = w.shape().into();
+            Some(ExtractedMatrix::Fp16 { w: metal_buf, k, m })
         }
         _ => None,
     }
+}
+
+// Legacy helper for backward compatibility
+fn extract_q4k_matrix(matrix: &Matrix) -> Option<(MetalBuffer, usize, usize)> {
+    match extract_matrix(matrix)? {
+        ExtractedMatrix::Q4K { w, k, m } => Some((w, k, m)),
+        ExtractedMatrix::Int8 { w, k, m, .. } => Some((w, k, m)),
+        ExtractedMatrix::Fp16 { w, k, m } => Some((w, k, m)),
+    }
+}
+
+/// Dispatch matmul to the appropriate kernel based on matrix type
+fn encode_matmul_dispatch(
+    cmd: &metal::CommandBufferRef,
+    matrix: &Matrix,
+    input: &MetalBuffer,
+    output: &MetalBuffer,
+    num_token: usize,
+    ctx: &V7MetalContext,
+) -> Option<()> {
+    match extract_matrix(matrix)? {
+        ExtractedMatrix::Q4K { w, k, m } => {
+            encode_matmul_q4k(
+                cmd,
+                &ctx.matmul_q4k,
+                &w,
+                input,
+                output,
+                k,
+                m,
+                num_token,
+                &ctx.ctx,
+            );
+        }
+        ExtractedMatrix::Int8 { w, minmax, k, m } => {
+            encode_matmul_int8(
+                cmd,
+                &ctx.matmul_int8,
+                &w,
+                &minmax,
+                input,
+                output,
+                k,
+                m,
+                num_token,
+                &ctx.ctx,
+            );
+        }
+        ExtractedMatrix::Fp16 { w, k, m } => {
+            encode_matmul_fp16(
+                cmd,
+                &ctx.matmul_fp16,
+                &w,
+                input,
+                output,
+                k,
+                m,
+                num_token,
+                &ctx.ctx,
+            );
+        }
+    }
+    Some(())
+}
+
+/// Dispatch matmul with squared relu activation
+fn encode_matmul_squared_relu_dispatch(
+    cmd: &metal::CommandBufferRef,
+    matrix: &Matrix,
+    input: &MetalBuffer,
+    output: &MetalBuffer,
+    num_token: usize,
+    ctx: &V7MetalContext,
+) -> Option<()> {
+    match extract_matrix(matrix)? {
+        ExtractedMatrix::Q4K { w, k, m } => {
+            encode_matmul_q4k(
+                cmd,
+                &ctx.matmul_q4k_squared_relu,
+                &w,
+                input,
+                output,
+                k,
+                m,
+                num_token,
+                &ctx.ctx,
+            );
+        }
+        ExtractedMatrix::Int8 { w, minmax, k, m } => {
+            encode_matmul_int8(
+                cmd,
+                &ctx.matmul_int8_squared_relu,
+                &w,
+                &minmax,
+                input,
+                output,
+                k,
+                m,
+                num_token,
+                &ctx.ctx,
+            );
+        }
+        ExtractedMatrix::Fp16 { w, k, m } => {
+            // Fp16 doesn't have squared relu variant yet, use regular and apply activation separately
+            encode_matmul_fp16(
+                cmd,
+                &ctx.matmul_fp16,
+                &w,
+                input,
+                output,
+                k,
+                m,
+                num_token,
+                &ctx.ctx,
+            );
+            // TODO: Add squared relu activation pass
+        }
+    }
+    Some(())
 }
 
 // Encoding helper functions
@@ -1040,6 +1194,90 @@ fn encode_token_shift(
 }
 
 fn encode_matmul_q4k(
+    cmd: &metal::CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    matrix: &MetalBuffer,
+    input: &MetalBuffer,
+    output: &MetalBuffer,
+    k: usize,
+    m: usize,
+    num_token: usize,
+    ctx: &MetalContext,
+) {
+    let params = MatmulParams {
+        k: k as u32,
+        m: m as u32,
+        t: num_token as u32,
+        b: 1,
+    };
+    let params_slice = unsafe {
+        std::slice::from_raw_parts(
+            &params as *const MatmulParams as *const u8,
+            std::mem::size_of::<MatmulParams>(),
+        )
+    };
+    let metal_params =
+        ctx.new_buffer_with_data(params_slice, metal::MTLResourceOptions::StorageModeShared);
+
+    let encoder = cmd.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(matrix), 0);
+    encoder.set_buffer(1, Some(input), 0);
+    encoder.set_buffer(2, Some(output), 0);
+    encoder.set_buffer(3, Some(&metal_params), 0);
+    encoder.set_threadgroup_memory_length(0, 64 * 4 * 4);
+
+    let num_groups_m = (m + 3) / 4;
+    let thread_group = metal::MTLSize::new(64, 1, 1);
+    let grid = metal::MTLSize::new(num_groups_m as u64, num_token as u64, 1);
+    encoder.dispatch_thread_groups(grid, thread_group);
+    encoder.end_encoding();
+}
+
+fn encode_matmul_int8(
+    cmd: &metal::CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    matrix: &MetalBuffer,
+    minmax: &MetalBuffer,
+    input: &MetalBuffer,
+    output: &MetalBuffer,
+    k: usize,
+    m: usize,
+    num_token: usize,
+    ctx: &MetalContext,
+) {
+    let params = MatmulParams {
+        k: k as u32,
+        m: m as u32,
+        t: num_token as u32,
+        b: 1,
+    };
+    let params_slice = unsafe {
+        std::slice::from_raw_parts(
+            &params as *const MatmulParams as *const u8,
+            std::mem::size_of::<MatmulParams>(),
+        )
+    };
+    let metal_params =
+        ctx.new_buffer_with_data(params_slice, metal::MTLResourceOptions::StorageModeShared);
+
+    let encoder = cmd.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(matrix), 0);
+    encoder.set_buffer(1, Some(minmax), 0);
+    encoder.set_buffer(2, Some(input), 0);
+    encoder.set_buffer(3, Some(output), 0);
+    encoder.set_buffer(4, Some(&metal_params), 0);
+    encoder.set_threadgroup_memory_length(0, 64 * 4 * 4);
+
+    let num_groups_m = (m + 3) / 4;
+    let thread_group = metal::MTLSize::new(64, 1, 1);
+    let grid = metal::MTLSize::new(num_groups_m as u64, num_token as u64, 1);
+    encoder.dispatch_thread_groups(grid, thread_group);
+    encoder.end_encoding();
+}
+
+fn encode_matmul_fp16(
     cmd: &metal::CommandBufferRef,
     pipeline: &ComputePipelineState,
     matrix: &MetalBuffer,

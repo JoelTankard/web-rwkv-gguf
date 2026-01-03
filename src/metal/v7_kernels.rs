@@ -834,12 +834,20 @@ kernel void matmul_int8(
     
     float4 local_sum = float4(0.0f);
     
-    // Process K dimension in chunks
+    // INT8_BLOCK_STEP = INT8_BLOCK_SIZE / 4 = 32 (u32s per minmax block)
+    const uint INT8_BLOCK_STEP = INT8_BLOCK_SIZE / 4;
+    
+    // WebGPU shader uses transpose(m) * x pattern:
+    // It reads 4 rows of the matrix at the same K position, forms a 4x4 matrix,
+    // then computes transpose(m) * x to get 4 output values.
+    // This is equivalent to: output[j] += sum_r(matrix[row_base + r][k + j] * input[k + r])
+    //
+    // To match this, we need to read 4 consecutive rows and do the transposed multiply.
+    
     for (uint i = tid; i < stride; i += 64) {
         uint k_idx = i * 4;  // Actual K index
-        uint block_idx = k_idx / INT8_BLOCK_SIZE;
         
-        // Read 4 input values
+        // Read 4 input values at positions k_idx, k_idx+1, k_idx+2, k_idx+3
         float4 x = float4(
             float(input[input_offset + k_idx]),
             float(input[input_offset + k_idx + 1]),
@@ -847,25 +855,37 @@ kernel void matmul_int8(
             float(input[input_offset + k_idx + 3])
         );
         
-        // Process 4 output rows
+        // Read 4 rows of the matrix at K position i, forming a 4x4 block
+        float4 m0, m1, m2, m3;
+        
         for (uint r = 0; r < 4; r++) {
             uint row = m_base + r;
             if (row >= M) continue;
             
-            // Matrix index: [b, row, i] where i is the u32 index
             uint mat_idx = (b * M + row) * stride + i;
             uint packed = matrix[mat_idx];
             
-            // Get minmax for this block
-            uint mm_idx = (b * M + row) * num_blocks + block_idx;
+            uint mm_idx = mat_idx / INT8_BLOCK_STEP;
             uint mm_packed = minmax[mm_idx];
             float min_val = float(as_type<half2>(mm_packed).x);
             float max_val = float(as_type<half2>(mm_packed).y);
             
-            // Dequantize and accumulate
             float4 w = dequant_int8(packed, min_val, max_val);
-            local_sum[r] += dot(w, x);
+            
+            // Store in the appropriate row
+            if (r == 0) m0 = w;
+            else if (r == 1) m1 = w;
+            else if (r == 2) m2 = w;
+            else m3 = w;
         }
+        
+        // Compute transpose(m) * x
+        // transpose(m)[j] = [m0[j], m1[j], m2[j], m3[j]]
+        // result[j] = dot(transpose(m)[j], x) = m0[j]*x[0] + m1[j]*x[1] + m2[j]*x[2] + m3[j]*x[3]
+        local_sum[0] += m0[0]*x[0] + m1[0]*x[1] + m2[0]*x[2] + m3[0]*x[3];
+        local_sum[1] += m0[1]*x[0] + m1[1]*x[1] + m2[1]*x[2] + m3[1]*x[3];
+        local_sum[2] += m0[2]*x[0] + m1[2]*x[1] + m2[2]*x[2] + m3[2]*x[3];
+        local_sum[3] += m0[3]*x[0] + m1[3]*x[1] + m2[3]*x[2] + m3[3]*x[3];
     }
     
     // Reduce across threads
@@ -915,14 +935,14 @@ kernel void matmul_int8_squared_relu(
     const uint T = params.T;
     
     const uint stride = K / 4;
-    const uint num_blocks = K / INT8_BLOCK_SIZE;
     const uint input_offset = (b * T + t) * K;
+    const uint INT8_BLOCK_STEP = INT8_BLOCK_SIZE / 4;
     
     float4 local_sum = float4(0.0f);
     
+    // Match WebGPU shader's transpose(m) * x pattern
     for (uint i = tid; i < stride; i += 64) {
         uint k_idx = i * 4;
-        uint block_idx = k_idx / INT8_BLOCK_SIZE;
         
         float4 x = float4(
             float(input[input_offset + k_idx]),
@@ -931,6 +951,9 @@ kernel void matmul_int8_squared_relu(
             float(input[input_offset + k_idx + 3])
         );
         
+        // Read 4 rows of the matrix at K position i
+        float4 m0, m1, m2, m3;
+        
         for (uint r = 0; r < 4; r++) {
             uint row = m_base + r;
             if (row >= M) continue;
@@ -938,14 +961,24 @@ kernel void matmul_int8_squared_relu(
             uint mat_idx = (b * M + row) * stride + i;
             uint packed = matrix[mat_idx];
             
-            uint mm_idx = (b * M + row) * num_blocks + block_idx;
+            uint mm_idx = mat_idx / INT8_BLOCK_STEP;
             uint mm_packed = minmax[mm_idx];
             float min_val = float(as_type<half2>(mm_packed).x);
             float max_val = float(as_type<half2>(mm_packed).y);
             
             float4 w = dequant_int8(packed, min_val, max_val);
-            local_sum[r] += dot(w, x);
+            
+            if (r == 0) m0 = w;
+            else if (r == 1) m1 = w;
+            else if (r == 2) m2 = w;
+            else m3 = w;
         }
+        
+        // Compute transpose(m) * x
+        local_sum[0] += m0[0]*x[0] + m1[0]*x[1] + m2[0]*x[2] + m3[0]*x[3];
+        local_sum[1] += m0[1]*x[0] + m1[1]*x[1] + m2[1]*x[2] + m3[1]*x[3];
+        local_sum[2] += m0[2]*x[0] + m1[2]*x[1] + m2[2]*x[2] + m3[2]*x[3];
+        local_sum[3] += m0[3]*x[0] + m1[3]*x[1] + m2[3]*x[2] + m3[3]*x[3];
     }
     
     scratch[tid * 4 + 0] = local_sum[0];

@@ -150,15 +150,11 @@ impl LazyMatrixData {
                 })
             }
             LazyMatrixVariant::Q4K { raw_data, shape } => {
-                // Transpose Q4K layout for coalesced memory access
-                let k = shape[0]; // K dimension (input features)
-                let m = shape[1]; // M dimension (output features/rows)
-                let num_sb_k = k / 256; // Number of super-blocks along K
-                let transposed = transpose_q4k_layout(&raw_data, m, num_sb_k);
-
-                let block_data_shape = Shape::new(transposed.len(), 1, 1, 1);
+                // Non-transposed layout - shape is already [K, M, 1, 1] from from_slice_rev
+                let block_data_shape = Shape::new(raw_data.len(), 1, 1, 1);
                 let w: TensorGpu<u8, ReadWrite> =
-                    TensorGpu::from_data_u8(context, block_data_shape, &transposed)?;
+                    TensorGpu::from_data_u8(context, block_data_shape, &raw_data)?;
+                // shape is already [K, M, 1, 1] which matches shader expectation
                 let s: TensorGpu<u8, ReadWrite> = context.tensor_init(shape);
                 Ok(Matrix::Q4K { w, s })
             }
