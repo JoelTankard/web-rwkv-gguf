@@ -573,3 +573,51 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 
 </details>
 
+## Q8_0 test
+
+### 2026-01-03 11:02:45 - baseline
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **6814.97 ms** |
+| **Prefill** | **205.74 tok/s** |
+| **Generation** | **52.42 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## Q4K F16 fallback
+
+### 2026-01-03 11:59:12 - disabled native Q4K
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q4_K_M.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **5023.83 ms** |
+| **Prefill** | **6.15 tok/s** |
+| **Generation** | **1.37 tok/s** |
+| Quality Hash | `3895ad4add71cff0` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129]
+```
+
+</details>
+
