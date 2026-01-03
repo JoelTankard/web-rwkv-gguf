@@ -36,6 +36,7 @@
 
 pub mod context;
 #[cfg(all(target_os = "macos", feature = "metal-acceleration"))]
+#[path = "_experimental/metal/mod.rs"]
 pub mod metal;
 pub mod num;
 pub mod profiler;
