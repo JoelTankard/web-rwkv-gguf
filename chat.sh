@@ -5,7 +5,7 @@
 set -e
 
 # Default values
-MODEL="assets/models/2.9b-Q4_K_M.gguf"
+MODEL="assets/models/2.9b-Q8_0.gguf"
 METAL=false
 
 # Parse arguments

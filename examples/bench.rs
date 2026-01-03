@@ -85,8 +85,6 @@ struct Cli {
     quant: usize,
     #[arg(long, value_name = "LAYERS", default_value_t = 0)]
     quant_nf4: usize,
-    #[arg(long, value_name = "LAYERS", default_value_t = 0)]
-    quant_sf4: usize,
     #[arg(long, default_value_t = 128)]
     token_chunk_size: usize,
     #[arg(short, long, action)]
@@ -126,7 +124,6 @@ async fn main() -> Result<()> {
     let quant = (0..cli.quant)
         .map(|layer| (layer, Quant::Int8))
         .chain((0..cli.quant_nf4).map(|layer| (layer, Quant::NF4)))
-        .chain((0..cli.quant_sf4).map(|layer| (layer, Quant::SF4)))
         .collect();
     let lora = match cli.lora {
         Some(path) => {
@@ -206,10 +203,9 @@ async fn main() -> Result<()> {
     }
     let tps = prompt_len as f64 / prefill.as_secs_f64() * REPEAT as f64;
     println!(
-        "| {:<56} | {:>10} | {:>12} | {:>7} | {:>14} |",
+        "| {:<56} | {:>10} | {:>7} | {:>14} |",
         model_path.file_name().unwrap().to_string_lossy(),
         cli.quant,
-        cli.quant_nf4.max(cli.quant_sf4),
         format!("pp{}", cli.prefill_length.to_string().clone()),
         format!("{:.2}", tps)
     );
@@ -238,10 +234,9 @@ async fn main() -> Result<()> {
     }
     let tps = num_token as f64 / generation.as_secs_f64() * REPEAT as f64;
     println!(
-        "| {:<56} | {:>10} | {:>12} | {:>7} | {:>14} |",
+        "| {:<56} | {:>10} | {:>7} | {:>14} |",
         model_path.file_name().unwrap().to_string_lossy(),
         cli.quant,
-        cli.quant_nf4.max(cli.quant_sf4),
         format!("tg{}", cli.generation_length.to_string().clone()),
         format!("{:.2}", tps)
     );

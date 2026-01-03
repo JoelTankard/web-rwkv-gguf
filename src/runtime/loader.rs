@@ -24,27 +24,6 @@ use crate::{
 pub const PAD_VEC: [usize; 4] = [8, 1, 1, 1];
 pub const PAD_MAT: [usize; 4] = [8, 8, 1, 1];
 
-const Q4K_BLOCK_BYTES: usize = 144;
-
-/// Transpose Q4K layout from row-major to column-major for coalesced memory access.
-/// Original layout: block[row][sb_k] - threads reading different rows access far-apart memory
-/// Transposed layout: block[sb_k][row] - consecutive threads read consecutive super-blocks
-///
-/// This improves memory bandwidth utilization during matmul by ensuring that
-/// threads in a workgroup access consecutive memory addresses.
-fn transpose_q4k_layout(raw_data: &[u8], num_rows: usize, num_sb_k: usize) -> Vec<u8> {
-    let mut transposed = vec![0u8; raw_data.len()];
-    for row in 0..num_rows {
-        for sb_k in 0..num_sb_k {
-            let src_offset = (row * num_sb_k + sb_k) * Q4K_BLOCK_BYTES;
-            let dst_offset = (sb_k * num_rows + row) * Q4K_BLOCK_BYTES;
-            transposed[dst_offset..dst_offset + Q4K_BLOCK_BYTES]
-                .copy_from_slice(&raw_data[src_offset..src_offset + Q4K_BLOCK_BYTES]);
-        }
-    }
-    transposed
-}
-
 #[derive(Debug, Error)]
 pub enum LoaderError {
     #[error("invalid model version")]
@@ -800,12 +779,6 @@ impl<R: Reader> Loader<R> {
                 self.load_in_place_matrix_f16(&buffer, &name)?;
                 Ok(Matrix::quant_nf4(&buffer)?)
             }
-            Quant::SF4 => {
-                let shape = self.tensor_shape(&name)?;
-                let buffer = context.tensor_init(shape);
-                self.load_in_place_matrix_f16(&buffer, &name)?;
-                Ok(Matrix::quant_sf4(&buffer, 5.0)?)
-            }
         }
     }
 
@@ -838,49 +811,6 @@ impl<R: Reader> Loader<R> {
 
                 log::info!("direct load (Q8_0 -> Int8): {name}");
                 Ok(Some(Matrix::Int8 { w, m }))
-            }
-            (GgmlType::Q4K, Quant::Int8) | (GgmlType::Q4K, Quant::None) => {
-                // DISABLED: Native Q4_K mat shader is too slow due to per-vec4 block header reads
-                // Fall back to F16 dequantization path which is known to work
-                Ok(None)
-            }
-            (GgmlType::Q5K, Quant::Int8) | (GgmlType::Q5K, Quant::None) => {
-                // Native Q5_K loading - store raw blocks for inline dequantization during matmul
-                let actual_elements = (raw_data.len() / 176) * 256;
-                if actual_elements != num_elements || num_elements % 256 != 0 {
-                    return Ok(None); // Fall back to F16 path
-                }
-
-                let block_data_shape = Shape::new(raw_data.len(), 1, 1, 1);
-                let w: TensorGpu<u8, ReadWrite> =
-                    TensorGpu::from_data_u8(context, block_data_shape, raw_data)?;
-                let s: TensorGpu<u8, ReadWrite> = context.tensor_init(shape);
-
-                log::info!(
-                    "native Q5_K load: {name} ({} elements, {} bytes)",
-                    num_elements,
-                    raw_data.len()
-                );
-                Ok(Some(Matrix::Q5K { w, s }))
-            }
-            (GgmlType::Q6K, Quant::Int8) | (GgmlType::Q6K, Quant::None) => {
-                // Native Q6_K loading - store raw blocks for inline dequantization during matmul
-                let actual_elements = (raw_data.len() / 210) * 256;
-                if actual_elements != num_elements || num_elements % 256 != 0 {
-                    return Ok(None); // Fall back to F16 path
-                }
-
-                let block_data_shape = Shape::new(raw_data.len(), 1, 1, 1);
-                let w: TensorGpu<u8, ReadWrite> =
-                    TensorGpu::from_data_u8(context, block_data_shape, raw_data)?;
-                let s: TensorGpu<u8, ReadWrite> = context.tensor_init(shape);
-
-                log::info!(
-                    "native Q6_K load: {name} ({} elements, {} bytes)",
-                    num_elements,
-                    raw_data.len()
-                );
-                Ok(Some(Matrix::Q6K { w, s }))
             }
             (GgmlType::Q4_0, Quant::NF4) => {
                 // Direct Q4_0 -> NF4 repacking
@@ -924,12 +854,6 @@ impl<R: Reader> Loader<R> {
                 let buffer = context.tensor_init(shape);
                 self.load_in_place_matrix_f16_discount(&buffer, &name, discount)?;
                 Ok(Matrix::quant_nf4(&buffer)?)
-            }
-            Quant::SF4 => {
-                let shape = self.tensor_shape(&name)?;
-                let buffer = context.tensor_init(shape);
-                self.load_in_place_matrix_f16_discount(&buffer, &name, discount)?;
-                Ok(Matrix::quant_sf4(&buffer, 5.0)?)
             }
         }
     }

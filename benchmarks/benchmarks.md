@@ -573,6 +573,29 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 
 </details>
 
+### 2026-01-03 22:45:24 - test
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **8482.25 ms** |
+| **Prefill** | **209.16 tok/s** |
+| **Generation** | **53.79 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+
 ## Q8_0 test
 
 ### 2026-01-03 11:02:45 - baseline

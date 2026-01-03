@@ -91,34 +91,6 @@ pub enum Matrix {
         w: TensorGpu<u8, ReadWrite>,
         m: TensorGpu<f16, ReadWrite>,
     },
-    /// Q4_K quantized matrix - stores raw GGUF Q4_K blocks for native quantized matmul.
-    /// Each super-block is 144 bytes encoding 256 elements (4.5 bits/element).
-    /// Layout: [d: f16, dmin: f16, scales: 12B, qs: 128B]
-    Q4K {
-        /// Raw Q4_K block data
-        w: TensorGpu<u8, ReadWrite>,
-        /// Metadata tensor for the logical matrix shape [K, M, B]
-        /// This is a dummy tensor used only for its shape metadata buffer.
-        s: TensorGpu<u8, ReadWrite>,
-    },
-    /// Q5_K quantized matrix - stores raw GGUF Q5_K blocks for native quantized matmul.
-    /// Each super-block is 176 bytes encoding 256 elements (5.5 bits/element).
-    /// Layout: [d: f16, dmin: f16, scales: 12B, qh: 32B, qs: 128B]
-    Q5K {
-        /// Raw Q5_K block data
-        w: TensorGpu<u8, ReadWrite>,
-        /// Metadata tensor for the logical matrix shape [K, M, B]
-        s: TensorGpu<u8, ReadWrite>,
-    },
-    /// Q6_K quantized matrix - stores raw GGUF Q6_K blocks for native quantized matmul.
-    /// Each super-block is 210 bytes encoding 256 elements (6.5625 bits/element).
-    /// Layout: [ql: 128B, qh: 64B, scales: 16B, d: f16]
-    Q6K {
-        /// Raw Q6_K block data
-        w: TensorGpu<u8, ReadWrite>,
-        /// Metadata tensor for the logical matrix shape [K, M, B]
-        s: TensorGpu<u8, ReadWrite>,
-    },
     /// Q8_0 quantized matrix - stores raw GGUF Q8_0 blocks for native quantized matmul.
     /// Each block is 34 bytes encoding 32 elements (8.5 bits/element).
     /// Layout: [scale: f16, data: i8[32]]
@@ -142,9 +114,6 @@ impl Matrix {
                 let shape = w.shape();
                 Shape::new(shape[0] * 2, shape[1], shape[2], shape[3])
             }
-            Matrix::Q4K { s, .. } => s.shape(),
-            Matrix::Q5K { s, .. } => s.shape(),
-            Matrix::Q6K { s, .. } => s.shape(),
             Matrix::Q8_0 { s, .. } => s.shape(),
         }
     }
@@ -159,9 +128,6 @@ impl Matrix {
             Matrix::Fp16(matrix) => TensorOp::matmul_vec_fp16(matrix, input, output, act, false),
             Matrix::Int8 { w, m } => TensorOp::matmul_vec_int8(w, m, input, output, act, false),
             Matrix::Fp4 { w, q, m } => TensorOp::matmul_vec_nf4(w, q, m, input, output, act, false),
-            Matrix::Q4K { w, s } => TensorOp::matmul_vec_q4k(w, s, input, output, act),
-            Matrix::Q5K { w, s } => TensorOp::matmul_vec_q5k(w, s, input, output, act),
-            Matrix::Q6K { w, s } => TensorOp::matmul_vec_q6k(w, s, input, output, act),
             Matrix::Q8_0 { w, s } => TensorOp::matmul_vec_q8_0(w, s, input, output, act),
         }
     }
@@ -176,9 +142,6 @@ impl Matrix {
             Matrix::Fp16(matrix) => TensorOp::matmul_vec_fp16(matrix, input, output, act, true),
             Matrix::Int8 { w, m } => TensorOp::matmul_vec_int8(w, m, input, output, act, true),
             Matrix::Fp4 { w, q, m } => TensorOp::matmul_vec_nf4(w, q, m, input, output, act, true),
-            Matrix::Q4K { w, s } => TensorOp::matmul_vec_q4k(w, s, input, output, act),
-            Matrix::Q5K { w, s } => TensorOp::matmul_vec_q5k(w, s, input, output, act),
-            Matrix::Q6K { w, s } => TensorOp::matmul_vec_q6k(w, s, input, output, act),
             Matrix::Q8_0 { w, s } => TensorOp::matmul_vec_q8_0(w, s, input, output, act),
         }
     }
@@ -193,9 +156,6 @@ impl Matrix {
             Matrix::Fp16(matrix) => TensorOp::matmul_mat_fp16(matrix, input, output, act),
             Matrix::Int8 { w, m } => TensorOp::matmul_mat_int8(w, m, input, output, act),
             Matrix::Fp4 { w, q, m } => TensorOp::matmul_mat_nf4(w, q, m, input, output, act),
-            Matrix::Q4K { w, s } => TensorOp::matmul_mat_q4k(w, s, input, output, act),
-            Matrix::Q5K { w, s } => TensorOp::matmul_mat_q5k(w, s, input, output, act),
-            Matrix::Q6K { w, s } => TensorOp::matmul_mat_q6k(w, s, input, output, act),
             Matrix::Q8_0 { w, s } => TensorOp::matmul_mat_q8_0(w, s, input, output, act),
         }
     }
@@ -257,28 +217,6 @@ impl Matrix {
         );
 
         let q = Float4Quant::default().0.to(context);
-        let w = context.tensor_init(matrix_shape);
-        let m = context.tensor_init(absmax_shape);
-
-        let op = TensorOp::quantize_mat_nf4(matrix, &q, &m, &w)?;
-        context.queue.submit(context.encode(&op));
-
-        Ok(Matrix::Fp4 { w, q, m })
-    }
-
-    pub fn quant_sf4(matrix: &TensorGpu<f16, ReadWrite>, nu: f64) -> Result<Self, TensorError> {
-        let context = matrix.context();
-        let shape = matrix.shape();
-
-        let matrix_shape = Shape::new(shape[0] / 2, shape[1], shape[2], shape[3]);
-        let absmax_shape = Shape::new(
-            shape.len().div_ceil(TensorOp::NF4_BLOCK_SIZE as usize),
-            1,
-            1,
-            1,
-        );
-
-        let q = Float4Quant::new_student(nu).0.to(context);
         let w = context.tensor_init(matrix_shape);
         let m = context.tensor_init(absmax_shape);
 

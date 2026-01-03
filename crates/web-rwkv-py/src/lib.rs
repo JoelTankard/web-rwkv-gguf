@@ -165,7 +165,6 @@ async fn load_runtime(
     path: PathBuf,
     quant: usize,
     quant_nf4: usize,
-    quant_sf4: usize,
 ) -> Result<(
     Context,
     ModelInfo,
@@ -180,7 +179,6 @@ async fn load_runtime(
     let quant_map = (0..quant)
         .map(|layer| (layer, Quant::Int8))
         .chain((0..quant_nf4).map(|layer| (layer, Quant::NF4)))
-        .chain((0..quant_sf4).map(|layer| (layer, Quant::SF4)))
         .collect();
 
     if is_gguf {
@@ -262,11 +260,11 @@ async fn load_runtime(
 #[pymethods]
 impl Model {
     #[new]
-    #[pyo3(signature = (path, quant=0, quant_nf4=0, quant_sf4=0))]
-    pub fn new(path: PathBuf, quant: usize, quant_nf4: usize, quant_sf4: usize) -> PyResult<Self> {
+    #[pyo3(signature = (path, quant=0, quant_nf4=0))]
+    pub fn new(path: PathBuf, quant: usize, quant_nf4: usize) -> PyResult<Self> {
         let tokio = Arc::new(tokio::runtime::Runtime::new()?);
         let (context, info, runtime, state) = tokio
-            .block_on(load_runtime(path, quant, quant_nf4, quant_sf4))
+            .block_on(load_runtime(path, quant, quant_nf4))
             .map_err(err)?;
         Ok(Self {
             tokio,

@@ -130,8 +130,6 @@ pub enum Quant {
     Int8,
     /// Use `NF4` quantization.
     NF4,
-    /// Use `SF4` quantization with `nu` set to 5.
-    SF4,
 }
 
 pub struct ModelBuilder<R: Reader> {
