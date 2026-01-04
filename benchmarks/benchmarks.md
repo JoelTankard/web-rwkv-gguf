@@ -500,6 +500,29 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 </details>
 
 
+### 2026-01-04 05:59:14 - No fusion
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **7155.32 ms** |
+| **Prefill** | **206.07 tok/s** |
+| **Generation** | **52.97 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+
 ## Q4K Metal Test
 
 ### 2026-01-02 14:47:27 - Testing with Q4K loading enabled
@@ -728,6 +751,198 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 | **Load Time** | **7072.35 ms** |
 | **Prefill** | **206.30 tok/s** |
 | **Generation** | **53.95 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## Fused ATT+FFN
+
+### 2026-01-04 05:58:31 - Fused ATT LN+6TS and FFN LN+TS
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **9135.10 ms** |
+| **Prefill** | **200.30 tok/s** |
+| **Generation** | **51.33 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## Fused ATT Only
+
+### 2026-01-04 06:00:23 - Only ATT LN+6TS fusion
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **7328.72 ms** |
+| **Prefill** | **195.95 tok/s** |
+| **Generation** | **50.69 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## Baseline 1
+
+### 2026-01-04 06:01:05 - No fusion
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **6982.19 ms** |
+| **Prefill** | **205.04 tok/s** |
+| **Generation** | **49.22 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## Baseline 2
+
+### 2026-01-04 06:01:40 - No fusion
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **6945.50 ms** |
+| **Prefill** | **208.48 tok/s** |
+| **Generation** | **54.20 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## Baseline 3
+
+### 2026-01-04 06:02:15 - No fusion
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **7021.89 ms** |
+| **Prefill** | **209.30 tok/s** |
+| **Generation** | **53.99 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## Fused 1
+
+### 2026-01-04 06:02:59 - ATT fusion
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **7214.15 ms** |
+| **Prefill** | **201.95 tok/s** |
+| **Generation** | **54.72 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## Fused 2
+
+### 2026-01-04 06:03:34 - ATT fusion
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **6852.12 ms** |
+| **Prefill** | **209.59 tok/s** |
+| **Generation** | **54.95 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## Fused 3
+
+### 2026-01-04 06:04:08 - ATT fusion
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **6951.45 ms** |
+| **Prefill** | **209.67 tok/s** |
+| **Generation** | **55.20 tok/s** |
 | Quality Hash | `c55251c506e49c98` |
 
 <details><summary>Quality tokens (first 16)</summary>

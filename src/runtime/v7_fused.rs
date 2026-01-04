@@ -1101,6 +1101,7 @@ fn dispatch_layer<F: Float>(
     ]);
 
     // FFN: Pre-matmul operations
+    // Note: FFN fusion (2 ops → 1) showed no benefit in benchmarks, so using separate ops
     ops.extend([
         TensorOp::blit(&buffer.x, &buffer.ffn_x)?,
         hook_op(Hook::PreFfn(index))?,
