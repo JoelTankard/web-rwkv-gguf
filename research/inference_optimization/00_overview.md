@@ -25,7 +25,7 @@ User Input → Tokenize → RnnInput
 | 01  | [Embedding Lookup](./01_embedding_lookup_optimization.md)        | 0.2-1ms/token    | Low-Medium  | Not started   |
 | 02  | [Command Buffer Batching](./02_command_buffer_batching.md)       | ~~5-20%~~        | Low         | ❌ No benefit |
 | 03  | [Fused Layer Operations](./03_fused_layer_operations.md)         | **2-5%**         | Medium-High | ✅ Done       |
-| 04  | [Matmul Shader Optimization](./04_matmul_shader_optimization.md) | 10-100% batch    | Medium      | Not started   |
+| 04  | [Matmul Shader Optimization](./04_matmul_shader_optimization.md) | ~~10-100%~~      | Medium      | ✅ No benefit |
 | 05  | [Async GPU-CPU Overlap](./05_async_gpu_cpu_overlap.md)           | 10-40%           | Medium-High | Not started   |
 | 06  | [State Management](./06_state_management_optimization.md)        | 5-20%            | Low-Medium  | Not started   |
 | 07  | [Memory Layout](./07_memory_layout_optimization.md)              | 5-25%            | Medium      | Not started   |
@@ -42,11 +42,12 @@ User Input → Tokenize → RnnInput
 ## Completed Optimizations
 
 1. ✅ **Fused token shift + LayerNorm** (03) - 7 dispatches → 1, **2-5% speedup**
+2. ✅ **Matmul shader optimization** (04) - Tested V2-V5 variants, **no improvement** (already memory-bound)
 
 ## High Impact (Medium-High Effort)
 
 1. ~~**Fused token shift + LayerNorm** (03) - 7 dispatches → 1~~ ✅ Done
-2. **Tiled matmul with shared memory** (04) - Major batch speedup
+2. ~~**Tiled matmul with shared memory** (04) - Major batch speedup~~ ✅ No benefit (memory-bound)
 3. **GPU-side sampling** (05) - Avoid 260KB readback per token
 4. **Pure Metal layer execution** (08) - Amortize sync overhead (blocked by sync issues)
 

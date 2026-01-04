@@ -1,5 +1,27 @@
 # Matrix Multiplication Shader Optimization
 
+## Status: ✅ Tested - No Significant Improvement
+
+**Conclusion**: The existing Q8_0 matmul shader is already well-optimized for Apple M2 Max. Multiple optimization approaches were tested with no significant improvement over baseline. The shader appears to be **memory-bandwidth limited**, not compute-limited.
+
+### Experiment Results (Q8_0, Apple M2 Max)
+
+| Variant  | Description                                   | Generation  | Change  |
+| -------- | --------------------------------------------- | ----------- | ------- |
+| Baseline | Original shader (BLOCK_SIZE=128)              | 53.80 tok/s | -       |
+| V2       | Fully unrolled inner loop + prefetched matrix | 52.76 tok/s | **-2%** |
+| V3       | Subgroup reduction (subgroupAdd)              | 53.71 tok/s | ~0%     |
+| V4       | Specialized single-token kernel               | 53.92 tok/s | +0.2%   |
+| V5       | Larger workgroup size (256)                   | 53.76 tok/s | ~0%     |
+
+**Files created**: `src/shaders/matmul_vec_q8_0_v2.wgsl`, `v4.wgsl`, `v5.wgsl`, `subgroup/matmul_vec_q8_0.wgsl`
+
+**Testing**: Set env vars `MATMUL_Q8_V2=1`, `MATMUL_Q8_V3=1` (requires `--features subgroup-ops`), `MATMUL_Q8_V4=1`, `MATMUL_Q8_V5=1`
+
+**Full results**: See `04_matmul_shader_optimization_results.md`
+
+---
+
 ## Current Implementation
 
 Location: `src/shaders/matmul_*.wgsl`, `src/tensor/ops.rs:740-1500`
