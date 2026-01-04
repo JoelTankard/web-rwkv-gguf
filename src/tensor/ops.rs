@@ -1806,7 +1806,7 @@ impl TensorOp {
                 cursors.layout(3, true),
                 state.meta_layout(4),
                 state.layout(5, true),
-                input.layout(6, true),
+                input.layout(6, false),  // read_write for in-place normalization
                 mix_r.layout(7, true),
                 mix_w.layout(8, true),
                 mix_k.layout(9, true),

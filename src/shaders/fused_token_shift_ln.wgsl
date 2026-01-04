@@ -30,11 +30,11 @@ struct Cursor {
 @group(0) @binding(4) var<uniform> vs: View;                                // [C, _, B]
 @group(0) @binding(5) var<storage, read> state: array<vec4<f32>>;           // (B, 1, C)
 
-// Input tensor (will be normalized in-place conceptually, but we read and write to different locations)
+// Input tensor (normalized in-place)
 #ifdef IN_FP16
-@group(0) @binding(6) var<storage, read> x: array<vec2<u32>>;               // (B, T, C)
+@group(0) @binding(6) var<storage, read_write> x: array<vec2<u32>>;         // (B, T, C)
 #else
-@group(0) @binding(6) var<storage, read> x: array<vec4<f32>>;               // (B, T, C)
+@group(0) @binding(6) var<storage, read_write> x: array<vec4<f32>>;         // (B, T, C)
 #endif
 
 // Time mix factors for each of the 6 token shifts (r, w, k, v, a, g)
@@ -96,6 +96,14 @@ fn load_x(bb: u32, i: u32) -> vec4<f32> {
     return unpack4x16float(x[bb + i]);
 #else
     return x[bb + i];
+#endif
+}
+
+fn store_x(bb: u32, i: u32, value: vec4<f32>) {
+#ifdef IN_FP16
+    x[bb + i] = pack4x16float(value);
+#else
+    x[bb + i] = value;
 #endif
 }
 
@@ -250,6 +258,9 @@ fn fused_token_shift_ln(@builtin(global_invocation_id) invocation_id: vec3<u32>)
         let factor_v = unpack4x16float(mix_v[i]);
         let factor_a = unpack4x16float(mix_a[i]);
         let factor_g = unpack4x16float(mix_g[i]);
+
+        // Store normalized value back to input buffer (in-place normalization like original layer_norm)
+        store_x(bb, i, x_normed);
 
         store_output_r(bb, i, mix(x_normed, x_prev, factor_r));
         store_output_w(bb, i, mix(x_normed, x_prev, factor_w));

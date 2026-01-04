@@ -477,6 +477,29 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 </details>
 
 
+### 2026-01-04 05:44:51 - No fusion
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **6905.47 ms** |
+| **Prefill** | **206.88 tok/s** |
+| **Generation** | **52.65 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+
 ## Q4K Metal Test
 
 ### 2026-01-02 14:47:27 - Testing with Q4K loading enabled
@@ -687,6 +710,30 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 
 ```
 [33, 3319, 227, 33, 3319, 33, 3319, 33, 3319, 33, 3319, 33, 3319, 33, 3319, 33]
+```
+
+</details>
+
+## Fused Fixed
+
+### 2026-01-04 05:44:06 - Fixed in-place normalization
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **7072.35 ms** |
+| **Prefill** | **206.30 tok/s** |
+| **Generation** | **53.95 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
 ```
 
 </details>
