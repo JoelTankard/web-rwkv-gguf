@@ -2,22 +2,39 @@
 
 ## Summary
 
-Implemented fused token shift + layer norm shader. Overcame WebGPU binding limit by increasing `max_storage_buffers_per_shader_stage` to 20. Achieved **3.8% speedup** (55.60 vs 53.55 tok/s) but with a **quality bug** that produces different outputs.
+Successfully implemented fused token shift + layer norm shader for the attention block. Achieved **2-5% speedup** with correct output. FFN fusion was also implemented but showed no benefit and is disabled.
 
-## Current Status
+## Final Results
 
-**Working but with quality difference:**
+| Metric     | Baseline         | Fused ATT        | Improvement     |
+| ---------- | ---------------- | ---------------- | --------------- |
+| Generation | 49-54 tok/s      | 54.7-55.2 tok/s  | **+2-5%**       |
+| Variance   | High             | Low              | More consistent |
+| Quality    | c55251c506e49c98 | c55251c506e49c98 | ✓ Match         |
 
--   Fused shader compiles and runs
--   3.8% speedup in generation (55.60 vs 53.55 tok/s)
--   Quality hash differs from baseline (different token outputs)
--   First token matches, subsequent tokens differ
+## What Works
 
-## Root Cause Analysis
+**Attention LayerNorm + 6 Token Shifts (7 ops → 1):**
 
-The quality difference is likely due to **incorrect tensor indexing**. The original shaders use view-based indexing via `compute_index(view, batch, token, index)` which handles tensor strides and offsets. The fused shader uses a simplified direct calculation `(batch * shape[1] + stack) * stride` which may not match the actual memory layout.
+-   Fuses layer_norm + 6 token_shift operations into single kernel
+-   Only used for single-token inference (generation)
+-   Falls back to separate ops for multi-token prefill
+-   Requires `max_storage_buffers_per_shader_stage = 20` (set in auto_limits)
 
-**To fix:** Add proper view metadata (uniform buffers) for each output tensor and use `compute_index()` for all tensor accesses.
+## What Didn't Work
+
+**FFN LayerNorm + Token Shift (2 ops → 1):**
+
+-   Implemented but showed no measurable benefit
+-   Likely because FFN only has 1 token shift vs 6 in attention
+-   The overhead of the fused kernel outweighs the dispatch savings
+-   Code is present but disabled in v7_fused.rs
+
+**Fused LoRA Triple (Idea 2):**
+
+-   Skipped - requires custom two-stage matmul kernel
+-   The LoRA operations involve actual matrix multiplications with different weight matrices
+-   Fusing matmul pairs is complex and would require significant shader work
 
 ## What Was Implemented
 
