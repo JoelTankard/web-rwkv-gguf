@@ -1729,6 +1729,144 @@ impl TensorOp {
         })
     }
 
+    /// Fused Token Shift + LayerNorm operation.
+    ///
+    /// Combines layer normalization with 6 token shifts into a single kernel.
+    /// This reduces 7 dispatches to 1 and eliminates redundant memory traffic.
+    ///
+    /// - `cursors`: Cursor tensor for batch/token tracking [T]
+    /// - `ln_w`, `ln_b`: Layer norm weights and biases [C, 1, 1]
+    /// - `state`: Previous state for token 0 mixing [C, _, B]
+    /// - `input`: Input tensor to normalize [C, T, B]
+    /// - `mix_r/w/k/v/a/g`: Time mix factors for each shift [C, 1, 1]
+    /// - `out_r/w/k/v/a/g`: Output tensors for each shift [C, T, B]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_token_shift_ln<'a, F: Float>(
+        cursors: &TensorGpu<u32, ReadWrite>,
+        ln_w: &TensorGpu<f16, ReadWrite>,
+        ln_b: &TensorGpu<f16, ReadWrite>,
+        state: impl Into<TensorGpuView<'a, f32>>,
+        input: &TensorGpu<F, ReadWrite>,
+        mix_r: &TensorGpu<f16, ReadWrite>,
+        mix_w: &TensorGpu<f16, ReadWrite>,
+        mix_k: &TensorGpu<f16, ReadWrite>,
+        mix_v: &TensorGpu<f16, ReadWrite>,
+        mix_a: &TensorGpu<f16, ReadWrite>,
+        mix_g: &TensorGpu<f16, ReadWrite>,
+        out_r: &TensorGpu<F, ReadWrite>,
+        out_w: &TensorGpu<F, ReadWrite>,
+        out_k: &TensorGpu<F, ReadWrite>,
+        out_v: &TensorGpu<F, ReadWrite>,
+        out_a: &TensorGpu<F, ReadWrite>,
+        out_g: &TensorGpu<F, ReadWrite>,
+        eps: f32,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let state: TensorGpuView<_> = state.into();
+        let context = input.context();
+        let shape = input.shape();
+        let [index, token, batch, _] = shape.into();
+
+        // Validate shapes
+        ln_w.check_shape([index, 1, 1, 1])?;
+        ln_b.check_shape([index, 1, 1, 1])?;
+        mix_r.check_shape([index, 1, 1, 1])?;
+        mix_w.check_shape([index, 1, 1, 1])?;
+        mix_k.check_shape([index, 1, 1, 1])?;
+        mix_v.check_shape([index, 1, 1, 1])?;
+        mix_a.check_shape([index, 1, 1, 1])?;
+        mix_g.check_shape([index, 1, 1, 1])?;
+        out_r.check_shape(shape)?;
+        out_w.check_shape(shape)?;
+        out_k.check_shape(shape)?;
+        out_v.check_shape(shape)?;
+        out_a.check_shape(shape)?;
+        out_g.check_shape(shape)?;
+
+        let key = PipelineKey::new(
+            "fused_token_shift_ln",
+            "fused_token_shift_ln",
+            Macros::new()
+                .u32("BLOCK_SIZE", BLOCK_SIZE)
+                .tensor(input, Some("IN"))
+                .tensor(out_r, Some("OUT"))
+                .f32("EPS", eps),
+        );
+
+        // Use 3 bind groups to stay within WebGPU's 8 storage buffers per stage limit
+        // Group 0: Uniforms, layer norm weights, cursors, state, input (7 bindings)
+        // Group 1: Time mix factors (6 bindings)
+        // Group 2: Output tensors (6 bindings)
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/fused_token_shift_ln.wgsl"),
+            &[
+                // Group 0
+                input.meta_layout(0),
+                ln_w.layout(1, true),
+                ln_b.layout(2, true),
+                cursors.layout(3, true),
+                state.meta_layout(4),
+                state.layout(5, true),
+                input.layout(6, true),
+                // Group 1
+                mix_r.layout(0, true),
+                mix_w.layout(1, true),
+                mix_k.layout(2, true),
+                mix_v.layout(3, true),
+                mix_a.layout(4, true),
+                mix_g.layout(5, true),
+                // Group 2
+                out_r.layout(0, false),
+                out_w.layout(1, false),
+                out_k.layout(2, false),
+                out_v.layout(3, false),
+                out_a.layout(4, false),
+                out_g.layout(5, false),
+            ],
+        );
+
+        // Build 3 separate bind groups
+        let bind_group_0 = BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, input)
+            .bind(1, ln_w)
+            .bind(2, ln_b)
+            .bind(3, cursors)
+            .bind_meta(4, &state)
+            .bind(5, &state)
+            .bind(6, input)
+            .build();
+
+        let bind_group_1 = BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .set_group(1)
+            .bind(0, mix_r)
+            .bind(1, mix_w)
+            .bind(2, mix_k)
+            .bind(3, mix_v)
+            .bind(4, mix_a)
+            .bind(5, mix_g)
+            .build();
+
+        let bind_group_2 = BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .set_group(2)
+            .bind(0, out_r)
+            .bind(1, out_w)
+            .bind(2, out_k)
+            .bind(3, out_v)
+            .bind(4, out_a)
+            .bind(5, out_g)
+            .build();
+
+        let bindings = vec![bind_group_0, bind_group_1, bind_group_2];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [1, token as u32, batch as u32],
+        })
+    }
+
     /// Cursor-free token shift for lazy evaluation.
     ///
     /// Unlike `token_shift`, this variant doesn't use cursor-based indexing.

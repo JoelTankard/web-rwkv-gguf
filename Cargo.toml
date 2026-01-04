@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/web-rwkv-derive", "crates/web-rwkv-py"]
+members = ["."]
 
 [workspace.package]
 authors = ["Zhenyuan Zhang <cryscan@umich.edu>"]
@@ -64,7 +64,6 @@ wasm-bindgen = "0.2"
 wgpu = "27.0"
 
 [dependencies.web-rwkv-derive]
-path = "crates/web-rwkv-derive"
 version = "0.10"
 
 [dependencies.tokio]
