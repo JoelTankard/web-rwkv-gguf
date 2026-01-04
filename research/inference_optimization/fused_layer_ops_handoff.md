@@ -2,7 +2,22 @@
 
 ## Summary
 
-Attempted to implement fused token shift + layer norm shader as described in `03_fused_layer_operations.md`. Hit a fundamental WebGPU limitation.
+Implemented fused token shift + layer norm shader. Overcame WebGPU binding limit by increasing `max_storage_buffers_per_shader_stage` to 20. Achieved **3.8% speedup** (55.60 vs 53.55 tok/s) but with a **quality bug** that produces different outputs.
+
+## Current Status
+
+**Working but with quality difference:**
+
+-   Fused shader compiles and runs
+-   3.8% speedup in generation (55.60 vs 53.55 tok/s)
+-   Quality hash differs from baseline (different token outputs)
+-   First token matches, subsequent tokens differ
+
+## Root Cause Analysis
+
+The quality difference is likely due to **incorrect tensor indexing**. The original shaders use view-based indexing via `compute_index(view, batch, token, index)` which handles tensor strides and offsets. The fused shader uses a simplified direct calculation `(batch * shape[1] + stack) * stride` which may not match the actual memory layout.
+
+**To fix:** Add proper view metadata (uniform buffers) for each output tensor and use `compute_index()` for all tensor accesses.
 
 ## What Was Implemented
 
