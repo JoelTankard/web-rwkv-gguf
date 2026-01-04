@@ -1,5 +1,19 @@
 # Fused Layer Operations
 
+## Status: ✅ IMPLEMENTED (Partial)
+
+**Result:** 2-5% speedup with fused attention LayerNorm + Token Shifts
+
+| Metric     | Baseline         | Fused ATT        | Improvement     |
+| ---------- | ---------------- | ---------------- | --------------- |
+| Generation | 49-54 tok/s      | 54.7-55.2 tok/s  | **+2-5%**       |
+| Variance   | High             | Low              | More consistent |
+| Quality    | c55251c506e49c98 | c55251c506e49c98 | ✓ Match         |
+
+**Implementation:** `src/runtime/v7_fused.rs`, `src/shaders/fused_token_shift_ln.wgsl`
+
+---
+
 ## Current Implementation
 
 Location: `src/runtime/v7.rs:813-1199` (`dispatch_layer`)
@@ -26,7 +40,9 @@ ops.extend([
 
 ## Optimization Ideas
 
-### Idea 1: Fused Token Shift + LayerNorm
+### Idea 1: Fused Token Shift + LayerNorm ✅ IMPLEMENTED
+
+**Status:** Working, 2-5% speedup
 
 Combine the 6 token shifts with layer norm into single kernel:
 
@@ -58,7 +74,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 **Benefit:** 7 dispatches → 1 dispatch, 7x less memory traffic for `x`
 
-### Idea 2: Fused Attention LoRA (w1→w2, a1→a2, g1→g2)
+### Idea 2: Fused Attention LoRA (w1→w2, a1→a2, g1→g2) ❌ SKIPPED
+
+**Status:** Not implemented - requires custom two-stage matmul kernel
+
+The LoRA operations involve actual matrix multiplications with different weight matrices. Fusing matmul pairs would require a custom shader that keeps the intermediate (LoRA rank ~32-128) in shared memory between two matmul stages. This is complex to implement correctly.
 
 The LoRA-style projections are small and can be fused:
 
@@ -97,7 +117,11 @@ TensorOp::time_first_v7(...)?
 
 These all operate on the same data and can share registers.
 
-### Idea 4: Fused FFN Block
+### Idea 4: Fused FFN Block ⚠️ TESTED - NO BENEFIT
+
+**Status:** Implemented FFN LayerNorm + Token Shift fusion, but showed no measurable benefit
+
+FFN only has 1 token shift (vs 6 in attention), so the overhead of the fused kernel outweighs the dispatch savings. The shader exists (`src/shaders/fused_ffn_ln_ts.wgsl`) but is disabled in `v7_fused.rs`.
 
 The FFN is a simple pattern that's highly fusable:
 

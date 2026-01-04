@@ -1,5 +1,15 @@
 # Command Buffer Batching Optimization
 
+## Status: ❌ TESTED - NO BENEFIT
+
+**Result:** Removing Sep markers or modifying command buffer batching provided no measurable performance improvement.
+
+**Tested:** Removing `TensorOp::Sep` entirely - no change in generation speed.
+
+**Conclusion:** WebGPU's implicit barriers between dispatches are sufficient. The Sep markers don't add significant overhead, and removing them doesn't help. The bottleneck is elsewhere (likely matmul compute time, not dispatch overhead).
+
+---
+
 ## Current Implementation
 
 Location: `src/tensor/ops.rs:82-175` (`Context::encode`)

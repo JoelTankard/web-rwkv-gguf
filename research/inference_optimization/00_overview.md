@@ -20,31 +20,35 @@ User Input → Tokenize → RnnInput
 
 ## Research Documents
 
-| #   | Topic                                                            | Potential Impact | Complexity  | Priority     |
-| --- | ---------------------------------------------------------------- | ---------------- | ----------- | ------------ |
-| 01  | [Embedding Lookup](./01_embedding_lookup_optimization.md)        | 0.2-1ms/token    | Low-Medium  | Medium       |
-| 02  | [Command Buffer Batching](./02_command_buffer_batching.md)       | 5-20%            | Low         | High         |
-| 03  | [Fused Layer Operations](./03_fused_layer_operations.md)         | 20-50%           | Medium-High | High         |
-| 04  | [Matmul Shader Optimization](./04_matmul_shader_optimization.md) | 10-100% batch    | Medium      | High         |
-| 05  | [Async GPU-CPU Overlap](./05_async_gpu_cpu_overlap.md)           | 10-40%           | Medium-High | Medium       |
-| 06  | [State Management](./06_state_management_optimization.md)        | 5-20%            | Low-Medium  | Medium       |
-| 07  | [Memory Layout](./07_memory_layout_optimization.md)              | 5-25%            | Medium      | Low          |
-| 08  | [Metal Backend](./08_metal_backend_integration.md)               | 2-4x (macOS)     | High        | High (macOS) |
-| 09  | [Quantization](./09_quantization_improvements.md)                | 10-40%           | Medium      | High         |
-| 10  | [Model Loading](./10_model_loading_optimization.md)              | 30-80% load      | Medium      | Medium       |
+| #   | Topic                                                            | Potential Impact | Complexity  | Status        |
+| --- | ---------------------------------------------------------------- | ---------------- | ----------- | ------------- |
+| 01  | [Embedding Lookup](./01_embedding_lookup_optimization.md)        | 0.2-1ms/token    | Low-Medium  | Not started   |
+| 02  | [Command Buffer Batching](./02_command_buffer_batching.md)       | ~~5-20%~~        | Low         | ❌ No benefit |
+| 03  | [Fused Layer Operations](./03_fused_layer_operations.md)         | **2-5%**         | Medium-High | ✅ Done       |
+| 04  | [Matmul Shader Optimization](./04_matmul_shader_optimization.md) | 10-100% batch    | Medium      | Not started   |
+| 05  | [Async GPU-CPU Overlap](./05_async_gpu_cpu_overlap.md)           | 10-40%           | Medium-High | Not started   |
+| 06  | [State Management](./06_state_management_optimization.md)        | 5-20%            | Low-Medium  | Not started   |
+| 07  | [Memory Layout](./07_memory_layout_optimization.md)              | 5-25%            | Medium      | Not started   |
+| 08  | [Metal Backend](./08_metal_backend_integration.md)               | 2-4x (macOS)     | High        | Blocked       |
+| 09  | [Quantization](./09_quantization_improvements.md)                | 10-40%           | Medium      | Not started   |
+| 10  | [Model Loading](./10_model_loading_optimization.md)              | 30-80% load      | Medium      | Not started   |
 
 ## Quick Wins (Low Effort, High Impact)
 
-1. **Remove Sep markers** (02) - Test if `TensorOp::Sep` is actually needed
+1. ~~**Remove Sep markers** (02) - Test if `TensorOp::Sep` is actually needed~~ ❌ No benefit
 2. **SIMD F32→F16** (10) - Speed up model loading conversion
 3. **NF4 LUT optimization** (09) - Use constant lookup table
 
+## Completed Optimizations
+
+1. ✅ **Fused token shift + LayerNorm** (03) - 7 dispatches → 1, **2-5% speedup**
+
 ## High Impact (Medium-High Effort)
 
-1. **Fused token shift + LayerNorm** (03) - 7 dispatches → 1
+1. ~~**Fused token shift + LayerNorm** (03) - 7 dispatches → 1~~ ✅ Done
 2. **Tiled matmul with shared memory** (04) - Major batch speedup
 3. **GPU-side sampling** (05) - Avoid 260KB readback per token
-4. **Pure Metal layer execution** (08) - Amortize sync overhead
+4. **Pure Metal layer execution** (08) - Amortize sync overhead (blocked by sync issues)
 
 ## Experimental (High Effort, Uncertain)
 
