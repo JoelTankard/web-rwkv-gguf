@@ -117,11 +117,11 @@ TensorOp::time_first_v7(...)?
 
 These all operate on the same data and can share registers.
 
-### Idea 4: Fused FFN Block ⚠️ TESTED - NO BENEFIT
+### Idea 4: Fused FFN Block ❌ TESTED - NO BENEFIT (REMOVED)
 
-**Status:** Implemented FFN LayerNorm + Token Shift fusion, but showed no measurable benefit
+**Status:** Tested FFN LayerNorm + Token Shift fusion, showed no measurable benefit, code removed.
 
-FFN only has 1 token shift (vs 6 in attention), so the overhead of the fused kernel outweighs the dispatch savings. The shader exists (`src/shaders/fused_ffn_ln_ts.wgsl`) but is disabled in `v7_fused.rs`.
+FFN only has 1 token shift (vs 6 in attention), so the overhead of the fused kernel outweighs the dispatch savings.
 
 The FFN is a simple pattern that's highly fusable:
 
