@@ -1794,15 +1794,12 @@ impl TensorOp {
                 .f32("EPS", eps),
         );
 
-        // Use 3 bind groups to stay within WebGPU's 8 storage buffers per stage limit
-        // Group 0: Uniforms, layer norm weights, cursors, state, input (7 bindings)
-        // Group 1: Time mix factors (6 bindings)
-        // Group 2: Output tensors (6 bindings)
+        // Single bind group with all 19 bindings
+        // Requires max_storage_buffers_per_shader_stage >= 17 (set in auto_limits)
         let pipeline = context.checkout_pipeline(
             &key,
             include_str!("../shaders/fused_token_shift_ln.wgsl"),
             &[
-                // Group 0
                 input.meta_layout(0),
                 ln_w.layout(1, true),
                 ln_b.layout(2, true),
@@ -1810,25 +1807,22 @@ impl TensorOp {
                 state.meta_layout(4),
                 state.layout(5, true),
                 input.layout(6, true),
-                // Group 1
-                mix_r.layout(0, true),
-                mix_w.layout(1, true),
-                mix_k.layout(2, true),
-                mix_v.layout(3, true),
-                mix_a.layout(4, true),
-                mix_g.layout(5, true),
-                // Group 2
-                out_r.layout(0, false),
-                out_w.layout(1, false),
-                out_k.layout(2, false),
-                out_v.layout(3, false),
-                out_a.layout(4, false),
-                out_g.layout(5, false),
+                mix_r.layout(7, true),
+                mix_w.layout(8, true),
+                mix_k.layout(9, true),
+                mix_v.layout(10, true),
+                mix_a.layout(11, true),
+                mix_g.layout(12, true),
+                out_r.layout(13, false),
+                out_w.layout(14, false),
+                out_k.layout(15, false),
+                out_v.layout(16, false),
+                out_a.layout(17, false),
+                out_g.layout(18, false),
             ],
         );
 
-        // Build 3 separate bind groups
-        let bind_group_0 = BindGroupBuilder::new(&key, context, &pipeline.layout)
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
             .bind_meta(0, input)
             .bind(1, ln_w)
             .bind(2, ln_b)
@@ -1836,29 +1830,19 @@ impl TensorOp {
             .bind_meta(4, &state)
             .bind(5, &state)
             .bind(6, input)
-            .build();
-
-        let bind_group_1 = BindGroupBuilder::new(&key, context, &pipeline.layout)
-            .set_group(1)
-            .bind(0, mix_r)
-            .bind(1, mix_w)
-            .bind(2, mix_k)
-            .bind(3, mix_v)
-            .bind(4, mix_a)
-            .bind(5, mix_g)
-            .build();
-
-        let bind_group_2 = BindGroupBuilder::new(&key, context, &pipeline.layout)
-            .set_group(2)
-            .bind(0, out_r)
-            .bind(1, out_w)
-            .bind(2, out_k)
-            .bind(3, out_v)
-            .bind(4, out_a)
-            .bind(5, out_g)
-            .build();
-
-        let bindings = vec![bind_group_0, bind_group_1, bind_group_2];
+            .bind(7, mix_r)
+            .bind(8, mix_w)
+            .bind(9, mix_k)
+            .bind(10, mix_v)
+            .bind(11, mix_a)
+            .bind(12, mix_g)
+            .bind(13, out_r)
+            .bind(14, out_w)
+            .bind(15, out_k)
+            .bind(16, out_v)
+            .bind(17, out_a)
+            .bind(18, out_g)
+            .build()];
 
         Ok(Self::Atom {
             pipeline,

@@ -196,6 +196,10 @@ impl ContextAutoLimits for ContextBuilder {
             .max(info.max_non_head_buffer_size())
             .max(info.head_buffer_size())
             as u32;
+        // Request higher storage buffer limit for fused operations (default is 8)
+        // Apple M-series GPUs support up to 31, most desktop GPUs support 16+
+        // Fused token shift + layer norm needs 17 storage buffers
+        self.limits.max_storage_buffers_per_shader_stage = 20;
         self
     }
 }

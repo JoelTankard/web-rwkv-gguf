@@ -1,12 +1,8 @@
-// Fused Token Shift + LayerNorm shader (Reduced version)
-// Combines layer normalization with 3 token shifts (r, k, v) into a single kernel
-// Benefits: 4 dispatches → 1, 4x less memory traffic for input tensor
+// Fused Token Shift + LayerNorm shader
+// Combines layer normalization with 6 token shifts into a single kernel
+// Benefits: 7 dispatches → 1, 7x less memory traffic for input tensor
 //
-// Stays within WebGPU's 8 storage buffers per stage limit:
-// - 2 uniform bindings (shape, state view)
-// - 6 storage bindings (ln_w, ln_b, cursors, state, x, outputs packed)
-//
-// Note: Only fuses r, k, v token shifts. w, a, g still use separate ops.
+// Requires max_storage_buffers_per_shader_stage >= 17 (set in auto_limits)
 
 struct View {
     shape: vec4<u32>,
@@ -22,28 +18,48 @@ struct Cursor {
 
 // Uniforms
 @group(0) @binding(0) var<uniform> shape: vec4<u32>;                        // [C, T, B]
+
+// LayerNorm weights
 @group(0) @binding(1) var<storage, read> ln_w: array<vec2<u32>>;            // (C) - f16
 @group(0) @binding(2) var<storage, read> ln_b: array<vec2<u32>>;            // (C) - f16
+
+// Cursors for batch/token tracking
 @group(0) @binding(3) var<storage, read> cursors: array<u32>;               // [T]
+
+// State for token 0 mixing
 @group(0) @binding(4) var<uniform> vs: View;                                // [C, _, B]
 @group(0) @binding(5) var<storage, read> state: array<vec4<f32>>;           // (B, 1, C)
 
-// Input tensor
+// Input tensor (will be normalized in-place conceptually, but we read and write to different locations)
 #ifdef IN_FP16
 @group(0) @binding(6) var<storage, read> x: array<vec2<u32>>;               // (B, T, C)
 #else
 @group(0) @binding(6) var<storage, read> x: array<vec4<f32>>;               // (B, T, C)
 #endif
 
-// Time mix factors for r, k, v (packed into one buffer with offsets)
-@group(0) @binding(7) var<storage, read> mix_rkv: array<vec2<u32>>;         // (3, C) - f16, packed [r, k, v]
+// Time mix factors for each of the 6 token shifts (r, w, k, v, a, g)
+@group(0) @binding(7) var<storage, read> mix_r: array<vec2<u32>>;           // (C) - f16
+@group(0) @binding(8) var<storage, read> mix_w: array<vec2<u32>>;           // (C) - f16
+@group(0) @binding(9) var<storage, read> mix_k: array<vec2<u32>>;           // (C) - f16
+@group(0) @binding(10) var<storage, read> mix_v: array<vec2<u32>>;          // (C) - f16
+@group(0) @binding(11) var<storage, read> mix_a: array<vec2<u32>>;          // (C) - f16
+@group(0) @binding(12) var<storage, read> mix_g: array<vec2<u32>>;          // (C) - f16
 
-// Output tensor (packed: 3 outputs interleaved or sequential)
-// Layout: [out_r | out_k | out_v] each of shape (B, T, C)
+// Output tensors for each token shift result
 #ifdef OUT_FP16
-@group(0) @binding(8) var<storage, read_write> out_rkv: array<vec2<u32>>;   // (3, B, T, C)
+@group(0) @binding(13) var<storage, read_write> out_r: array<vec2<u32>>;    // (B, T, C)
+@group(0) @binding(14) var<storage, read_write> out_w: array<vec2<u32>>;    // (B, T, C)
+@group(0) @binding(15) var<storage, read_write> out_k: array<vec2<u32>>;    // (B, T, C)
+@group(0) @binding(16) var<storage, read_write> out_v: array<vec2<u32>>;    // (B, T, C)
+@group(0) @binding(17) var<storage, read_write> out_a: array<vec2<u32>>;    // (B, T, C)
+@group(0) @binding(18) var<storage, read_write> out_g: array<vec2<u32>>;    // (B, T, C)
 #else
-@group(0) @binding(8) var<storage, read_write> out_rkv: array<vec4<f32>>;   // (3, B, T, C)
+@group(0) @binding(13) var<storage, read_write> out_r: array<vec4<f32>>;    // (B, T, C)
+@group(0) @binding(14) var<storage, read_write> out_w: array<vec4<f32>>;    // (B, T, C)
+@group(0) @binding(15) var<storage, read_write> out_k: array<vec4<f32>>;    // (B, T, C)
+@group(0) @binding(16) var<storage, read_write> out_v: array<vec4<f32>>;    // (B, T, C)
+@group(0) @binding(17) var<storage, read_write> out_a: array<vec4<f32>>;    // (B, T, C)
+@group(0) @binding(18) var<storage, read_write> out_g: array<vec4<f32>>;    // (B, T, C)
 #endif
 
 // Workgroup shared memory for layer norm reduction

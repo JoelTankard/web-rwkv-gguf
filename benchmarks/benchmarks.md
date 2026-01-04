@@ -454,6 +454,29 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 
 </details>
 
+### 2026-01-04 05:37:23 - No fusion - separate layer norm and token shifts
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **6810.33 ms** |
+| **Prefill** | **207.21 tok/s** |
+| **Generation** | **53.55 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+
 ## Q4K Metal Test
 
 ### 2026-01-02 14:47:27 - Testing with Q4K loading enabled
@@ -640,6 +663,30 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 
 ```
 [33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129, 33, 3319, 153, 129]
+```
+
+</details>
+
+## Fused Test
+
+### 2026-01-04 05:36:40 - Testing fused token shift + layer norm with increased buffer limit
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **6985.49 ms** |
+| **Prefill** | **207.20 tok/s** |
+| **Generation** | **55.60 tok/s** |
+| Quality Hash | `9885271c252a7220` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 3319, 227, 33, 3319, 33, 3319, 33, 3319, 33, 3319, 33, 3319, 33, 3319, 33]
 ```
 
 </details>
