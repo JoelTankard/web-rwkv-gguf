@@ -21,7 +21,7 @@ use crate::{
     num::Float,
     runtime::model::Quant,
     tensor::{
-        cache::ResourceCache,
+        cache::{ResourceCache, SharedResourceCache},
         kind::ReadWrite,
         lazy_tensor::LazyTensor,
         matrix::Matrix,
@@ -507,6 +507,27 @@ impl Job for RnnJob {
     }
 }
 
+impl RnnJob {
+    /// GPU-side argmax sampling - returns token indices without reading back full logits.
+    /// This avoids reading back 260KB of logits per token (65K vocab × 4 bytes).
+    /// Instead, performs argmax on GPU and only reads back 4 bytes per token.
+    pub async fn back_sampled(self) -> Result<Vec<u32>, RuntimeError> {
+        let context = self.output.context();
+        let shape = self.output.shape();
+        
+        // Create output tensor for token indices
+        let output_indices: TensorGpu<u32, ReadWrite> = context.tensor_init([shape[1], shape[2], 1, 1]);
+        
+        // Run argmax on GPU
+        let op = TensorOp::sample_argmax(&self.output, &output_indices)?;
+        context.queue.submit(context.encode(&op));
+        
+        // Read back only the token indices (4 bytes per token instead of 260KB)
+        let result = output_indices.back().await;
+        Ok(result.data().to_vec())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Frame<F: Float> {
     pub state: State,
@@ -517,6 +538,14 @@ pub struct Frame<F: Float> {
 pub type HookFn<F> = Box<dyn Fn(Frame<F>) -> Result<TensorOp, TensorError> + Send + Sync>;
 pub type HookMap<F> = HashMap<Hook, HookFn<F>>;
 
+/// Cache key for TensorOp caching
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OpCacheKey {
+    num_token: usize,
+    num_header: usize,
+    embed_only: bool,
+}
+
 #[derive(Clone)]
 pub struct Bundle<F: Float> {
     model: Model,
@@ -524,6 +553,8 @@ pub struct Bundle<F: Float> {
     hooks: Arc<HookMap<F>>,
     buffers: ResourceCache<usize, Runtime<F>>,
     headers: ResourceCache<usize, Header<F>>,
+    /// Cache for TensorOp trees - avoids rebuilding ops each dispatch
+    op_cache: SharedResourceCache<OpCacheKey, TensorOp>,
     phantom: PhantomData<F>,
 }
 
@@ -547,6 +578,7 @@ impl<F: Float> Bundle<F> {
             hooks: Default::default(),
             buffers: ResourceCache::new(4),
             headers: ResourceCache::new(4),
+            op_cache: SharedResourceCache::new(8),
             phantom: PhantomData,
         }
     }
@@ -576,6 +608,87 @@ impl<F: Float> Bundle<F> {
     ) -> Arc<Header<F>> {
         self.headers
             .checkout(num_header, || Header::new(context, info, num_header))
+    }
+
+    /// Build the TensorOp tree for inference.
+    /// This is extracted to allow caching of the ops.
+    fn build_ops(
+        &self,
+        seed: &RnnInfo,
+        buffer: &Arc<Runtime<F>>,
+        header: &Arc<Header<F>>,
+        frame: &Frame<F>,
+        head_size: usize,
+    ) -> Result<TensorOp, TensorError> {
+        let model = &self.model;
+        let tensor = &model.tensor;
+        let num_token = seed.num_token();
+        let num_header = seed.redirect().headers.len();
+        let embed_only = seed.is_embed_only();
+
+        let redirect = seed.redirect();
+        let (head_op, head_x) = redirect.op(&buffer.x, &header.head_x)?;
+
+        let hook_op = |hook: Hook| hook_op(&self.hooks, &hook, frame);
+        let mut ops = vec![];
+
+        // Embed phase
+        {
+            #[cfg(feature = "trace")]
+            let _span = tracing::trace_span!("embed").entered();
+
+            ops.extend([
+                hook_op(Hook::PostEmbedLoaded)?,
+                TensorOp::layer_norm(
+                    &tensor.embed.ln.w,
+                    &tensor.embed.ln.b,
+                    &buffer.input,
+                    Model::LN_EPS,
+                )?,
+                TensorOp::blit(&buffer.input, &buffer.x)?,
+                hook_op(Hook::PostEmbedLayerNorm)?,
+            ]);
+        }
+
+        // Layer phase
+        for (index, layer) in tensor.layers.iter().enumerate() {
+            #[cfg(feature = "trace")]
+            let _span = tracing::trace_span!("layer", index).entered();
+
+            let hooks = self.hooks.clone();
+            let frame = frame.clone();
+            let layer = layer.clone();
+
+            let op = dispatch_layer(
+                hooks,
+                frame,
+                layer,
+                index,
+                num_token,
+                head_size,
+                model.rescale,
+            )?;
+            ops.push(op);
+
+            if (index + 1) % model.sep == 0 {
+                ops.push(TensorOp::Sep);
+            }
+        }
+
+        // Header phase
+        {
+            #[cfg(feature = "trace")]
+            let _span = tracing::trace_span!("header").entered();
+
+            let hooks = self.hooks.clone();
+            let frame = frame.clone();
+            let head = model.tensor.head.clone();
+
+            let op = dispatch_header(hooks, frame, head, head_x, num_header, head_op, embed_only)?;
+            ops.push(op);
+        }
+
+        Ok(TensorOp::List(ops))
     }
 }
 
@@ -619,13 +732,13 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
         let state = &self.state;
         let context = &model.context;
         let info = &model.info;
-        let tensor = &model.tensor;
 
         let num_token = seed.num_token();
         let head_size = info.num_emb / info.num_head;
 
         let redirect = seed.redirect();
         let num_header = redirect.headers.len();
+        let embed_only = seed.is_embed_only();
 
         let buffer = self.checkout_buffer(context, info, num_token);
         let header = self.checkout_header(context, info, num_header);
@@ -638,6 +751,7 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
         context.maintain();
         self.buffers.maintain();
         self.headers.maintain();
+        self.op_cache.maintain();
 
         if num_token == 0 {
             return Ok(RnnJob {
@@ -653,69 +767,30 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
         #[cfg(feature = "trace")]
         let _span = tracing::trace_span!("build").entered();
 
-        let (head_op, head_x) = redirect.op(&buffer.x, &header.head_x)?;
-
-        let hook_op = |hook: Hook| hook_op(&self.hooks, &hook, &frame);
-        let mut ops = vec![];
-
-        {
-            #[cfg(feature = "trace")]
-            let _span = tracing::trace_span!("embed").entered();
-
-            ops.extend([
-                hook_op(Hook::PostEmbedLoaded)?,
-                TensorOp::layer_norm(
-                    &tensor.embed.ln.w,
-                    &tensor.embed.ln.b,
-                    &buffer.input,
-                    Model::LN_EPS,
-                )?,
-                TensorOp::blit(&buffer.input, &buffer.x)?,
-                hook_op(Hook::PostEmbedLayerNorm)?,
-            ]);
+        // Check if we can use cached ops (only when no hooks are registered)
+        let can_cache = self.hooks.is_empty();
+        let cache_key = OpCacheKey {
+            num_token,
+            num_header,
+            embed_only,
         };
 
-        for (index, layer) in tensor.layers.iter().enumerate() {
-            #[cfg(feature = "trace")]
-            let _span = tracing::trace_span!("layer", index).entered();
-
-            let hooks = self.hooks.clone();
-            let frame = frame.clone();
-            let layer = layer.clone();
-
-            let op = dispatch_layer(
-                hooks,
-                frame,
-                layer,
-                index,
-                num_token,
-                head_size,
-                model.rescale,
-            )?;
-            ops.push(op);
-
-            if (index + 1) % model.sep == 0 {
-                ops.push(TensorOp::Sep);
-            }
-        }
-
-        {
-            #[cfg(feature = "trace")]
-            let _span = tracing::trace_span!("header").entered();
-
-            let hooks = self.hooks.clone();
-            let frame = frame.clone();
-            let head = model.tensor.head.clone();
-            let embed_only = seed.is_embed_only();
-
-            let op = dispatch_header(hooks, frame, head, head_x, num_header, head_op, embed_only)?;
-            ops.push(op);
-        }
+        let ops = if can_cache {
+            // Try to get cached ops, or build and cache them
+            let ops_arc = self.op_cache.checkout(cache_key, || {
+                self.build_ops(&seed, &buffer, &header, &frame, head_size)
+                    .unwrap_or_else(|_| TensorOp::empty())
+            });
+            (*ops_arc).clone()
+        } else {
+            // Hooks are registered, can't cache - build fresh
+            self.build_ops(&seed, &buffer, &header, &frame, head_size)?
+        };
 
         let commands = {
             #[cfg(feature = "trace")]
             let _span = tracing::trace_span!("encode").entered();
-            context.encode(&TensorOp::List(ops))
+            context.encode(&ops)
         };
 
         Ok(RnnJob {

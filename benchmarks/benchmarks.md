@@ -268,6 +268,29 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 
 </details>
 
+### 2026-01-04 08:38:14 - Q8_0 Metal kernel
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **9428.01 ms** |
+| **Prefill** | **596.39 tok/s** |
+| **Generation** | **83.54 tok/s** |
+| Quality Hash | `438287259638b200` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361]
+```
+
+</details>
+
+
 ## Metal V7 Test
 
 ### 2026-01-02 14:31:44 - Enabled Q4K loading
@@ -949,6 +972,495 @@ cargo run --release --example benchmark -- --model <path> --title "<title>" --ch
 
 ```
 [33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## Async GPU-CPU Overlap
+
+### 2026-01-04 06:42:40 - Baseline before optimization
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **9168.66 ms** |
+| **Prefill** | **208.60 tok/s** |
+| **Generation** | **54.11 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## GPU Compute Opt
+
+### 2026-01-04 07:40:33 - Testing fused vs non-fused
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **7458.22 ms** |
+| **Prefill** | **203.49 tok/s** |
+| **Generation** | **53.19 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+
+### 2026-01-04 07:41:17 - Testing non-fused baseline
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **6885.09 ms** |
+| **Prefill** | **205.44 tok/s** |
+| **Generation** | **53.08 tok/s** |
+| Quality Hash | `c55251c506e49c98` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157, 33, 236, 149, 157]
+```
+
+</details>
+
+## TensorOp Caching
+
+### 2026-01-04 08:13:31 - Added TensorOp tree caching
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **7187.30 ms** |
+| **Prefill** | **207.62 tok/s** |
+| **Generation** | **54.31 tok/s** |
+| Quality Hash | `552b965f4d00419e` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 65535, 64865, 64865, 65535, 64865, 64865, 65535, 64865, 64865, 65535, 64865, 64865, 65535, 64865, 64865]
+```
+
+</details>
+
+## TensorOp Caching Verify
+
+### 2026-01-04 08:14:15 - Verify correctness
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **7148.29 ms** |
+| **Prefill** | **207.11 tok/s** |
+| **Generation** | **53.92 tok/s** |
+| Quality Hash | `4dbb661be0c4c8f4` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 21818, 65535, 21818, 65535, 21818, 21818, 65535, 21818, 21818, 65535, 21818, 21818, 65535, 21818, 21818]
+```
+
+</details>
+
+## WebGPU Baseline
+
+### 2026-01-04 08:39:08 - No Metal
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **7517.54 ms** |
+| **Prefill** | **205.30 tok/s** |
+| **Generation** | **53.76 tok/s** |
+| Quality Hash | `ce40c707fa5590eb` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[33, 3319, 65535, 116, 65535, 116, 21265, 65535, 116, 21265, 22590, 21265, 21265, 22590, 21265, 21265]
+```
+
+</details>
+
+## Metal Q8_0
+
+### 2026-01-04 09:00:15 - Native Q8_0 loading
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4646.32 ms** |
+| **Prefill** | **328.02 tok/s** |
+| **Generation** | **87.75 tok/s** |
+| Quality Hash | `f8abdfcaacccd600` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[267, 267, 267, 267, 267, 267, 267, 267, 267, 267, 267, 267, 267, 267, 267, 267]
+```
+
+</details>
+
+
+### 2026-01-04 09:01:44 - Fixed dispatch
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4547.13 ms** |
+| **Prefill** | **332.12 tok/s** |
+| **Generation** | **99.92 tok/s** |
+| Quality Hash | `fc01fbe3ced0ed58` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[267, 267, 65535, 267, 65535, 267, 2779, 65535, 267, 51284, 65535, 267, 45, 65535, 267, 51284]
+```
+
+</details>
+
+
+### 2026-01-04 09:14:45 - Fixed block layout
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4919.69 ms** |
+| **Prefill** | **88.80 tok/s** |
+| **Generation** | **39.26 tok/s** |
+| Quality Hash | `16a7da583c362c1e` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[332, 332, 46, 332, 46, 332, 332, 46, 332, 332, 46, 332, 332, 46, 332, 332]
+```
+
+</details>
+
+
+### 2026-01-04 09:17:10 - Debug
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4654.32 ms** |
+| **Prefill** | **88.55 tok/s** |
+| **Generation** | **39.69 tok/s** |
+| Quality Hash | `ecc6ad6c8a4205cd` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[332, 332, 65535, 332, 65535, 332, 332, 65535, 332, 332, 65535, 332, 332, 65535, 332, 332]
+```
+
+</details>
+
+
+### 2026-01-04 09:17:56 - Debug
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4524.61 ms** |
+| **Prefill** | **87.61 tok/s** |
+| **Generation** | **39.00 tok/s** |
+| Quality Hash | `f091452164ed0fc` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[46, 332, 46, 332, 46, 332, 332, 46, 332, 332, 46, 332, 332, 46, 332, 332]
+```
+
+</details>
+
+
+### 2026-01-04 09:19:43 - Debug
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4618.54 ms** |
+| **Prefill** | **87.50 tok/s** |
+| **Generation** | **38.35 tok/s** |
+| Quality Hash | `bc667ec83d759800` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332]
+```
+
+</details>
+
+
+### 2026-01-04 09:20:21 - Debug
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4536.80 ms** |
+| **Prefill** | **88.06 tok/s** |
+| **Generation** | **38.88 tok/s** |
+| Quality Hash | `16a7da583c362c1e` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[332, 332, 46, 332, 46, 332, 332, 46, 332, 332, 46, 332, 332, 46, 332, 332]
+```
+
+</details>
+
+
+### 2026-01-04 09:21:35 - Debug
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4530.02 ms** |
+| **Prefill** | **86.56 tok/s** |
+| **Generation** | **38.57 tok/s** |
+| Quality Hash | `f091452164ed0fc` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[46, 332, 46, 332, 46, 332, 332, 46, 332, 332, 46, 332, 332, 46, 332, 332]
+```
+
+</details>
+
+
+### 2026-01-04 09:22:39 - Debug
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4619.32 ms** |
+| **Prefill** | **86.69 tok/s** |
+| **Generation** | **38.73 tok/s** |
+| Quality Hash | `b4c7b8c2178e3cde` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[46, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332]
+```
+
+</details>
+
+
+### 2026-01-04 09:23:37 - Debug
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4515.55 ms** |
+| **Prefill** | **86.68 tok/s** |
+| **Generation** | **38.76 tok/s** |
+| Quality Hash | `b4c7b8c2178e3cde` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[46, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332]
+```
+
+</details>
+
+
+### 2026-01-04 09:24:18 - Debug
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4514.77 ms** |
+| **Prefill** | **86.43 tok/s** |
+| **Generation** | **38.93 tok/s** |
+| Quality Hash | `b4c7b8c2178e3cde` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[46, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332]
+```
+
+</details>
+
+
+### 2026-01-04 09:25:57 - Debug
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4427.64 ms** |
+| **Prefill** | **88.73 tok/s** |
+| **Generation** | **39.63 tok/s** |
+| Quality Hash | `702229209b4f10d1` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[332, 46, 65535, 46, 65535, 46, 46, 65535, 46, 46, 65535, 46, 46, 65535, 46, 46]
+```
+
+</details>
+
+
+### 2026-01-04 09:26:36 - Debug
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **4549.89 ms** |
+| **Prefill** | **88.78 tok/s** |
+| **Generation** | **39.30 tok/s** |
+| Quality Hash | `bc667ec83d759800` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332, 332]
+```
+
+</details>
+
+
+### 2026-01-04 09:27:59 - Fixed discount loading
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **2603.25 ms** |
+| **Prefill** | **389.75 tok/s** |
+| **Generation** | **101.68 tok/s** |
+| Quality Hash | `438287259638b200` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361]
+```
+
+</details>
+
+
+### 2026-01-04 09:31:35 - Fixed threadgroup position
+
+| Metric | Value |
+|--------|-------|
+| Model | 2.9b-Q8_0.gguf |
+| Version | V7 |
+| Layers | 32 |
+| Embedding | 2560 |
+| GPU | Apple M2 Max |
+| **Load Time** | **2779.35 ms** |
+| **Prefill** | **61.30 tok/s** |
+| **Generation** | **103.63 tok/s** |
+| Quality Hash | `4382872596391595` |
+
+<details><summary>Quality tokens (first 16)</summary>
+
+```
+[2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361, 2361]
 ```
 
 </details>

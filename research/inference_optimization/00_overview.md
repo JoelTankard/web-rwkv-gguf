@@ -26,7 +26,7 @@ User Input → Tokenize → RnnInput
 | 02  | [Command Buffer Batching](./02_command_buffer_batching.md)       | ~~5-20%~~        | Low         | ❌ No benefit |
 | 03  | [Fused Layer Operations](./03_fused_layer_operations.md)         | **2-5%**         | Medium-High | ✅ Done       |
 | 04  | [Matmul Shader Optimization](./04_matmul_shader_optimization.md) | ~~10-100%~~      | Medium      | ✅ No benefit |
-| 05  | [Async GPU-CPU Overlap](./05_async_gpu_cpu_overlap.md)           | 10-40%           | Medium-High | Not started   |
+| 05  | [Async GPU-CPU Overlap](./05_async_gpu_cpu_overlap.md)           | **~0.4%**        | Medium-High | ✅ Tested     |
 | 06  | [State Management](./06_state_management_optimization.md)        | 5-20%            | Low-Medium  | Not started   |
 | 07  | [Memory Layout](./07_memory_layout_optimization.md)              | 5-25%            | Medium      | Not started   |
 | 08  | [Metal Backend](./08_metal_backend_integration.md)               | 2-4x (macOS)     | High        | Blocked       |
@@ -43,13 +43,18 @@ User Input → Tokenize → RnnInput
 
 1. ✅ **Fused token shift + LayerNorm** (03) - 7 dispatches → 1, **2-5% speedup**
 2. ✅ **Matmul shader optimization** (04) - Tested V2-V5 variants, **no improvement** (already memory-bound)
+3. ✅ **GPU-side sampling** (05) - Implemented `TensorOp::sample_argmax`, **~0.4% speedup** (unified memory limits benefit)
+4. ✅ **Triple buffering** (05) - Tested, **no benefit** (TokioRuntime already has job pre-building)
+5. ✅ **Bind group caching** (05) - Already implemented, **73.8% dispatch improvement** on first run (25ms→6.6ms)
+6. ✅ **TensorOp tree caching** (05) - Implemented, **69% dispatch reduction** (6.6ms→2.1ms), **~2.5% throughput gain**
 
 ## High Impact (Medium-High Effort)
 
 1. ~~**Fused token shift + LayerNorm** (03) - 7 dispatches → 1~~ ✅ Done
 2. ~~**Tiled matmul with shared memory** (04) - Major batch speedup~~ ✅ No benefit (memory-bound)
-3. **GPU-side sampling** (05) - Avoid 260KB readback per token
+3. ~~**GPU-side sampling** (05) - Avoid 260KB readback per token~~ ✅ Done (~0.4% on unified memory)
 4. **Pure Metal layer execution** (08) - Amortize sync overhead (blocked by sync issues)
+5. ~~**TensorOp tree caching** (05) - Cache dispatch results to reduce 6.6ms build time~~ ✅ Done (69% dispatch reduction)
 
 ## Experimental (High Effort, Uncertain)
 

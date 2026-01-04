@@ -12,6 +12,7 @@ pub mod lazy_runtime;
 pub mod loader;
 pub mod model;
 pub mod softmax;
+pub mod triple_buffer;
 pub mod v4;
 pub mod v5;
 pub mod v6;

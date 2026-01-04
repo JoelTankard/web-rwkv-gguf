@@ -317,6 +317,11 @@ fn custom_tanh(x: vec4<f32>) -> vec4<f32> {
     }
 }
 
+/// A GPU compute operation that can be encoded into command buffers.
+/// 
+/// `TensorOp` is cloneable because all fields are `Arc`-wrapped or simple types.
+/// This enables caching of dispatch results to avoid rebuilding the operation tree.
+#[derive(Clone)]
 pub enum TensorOp {
     Atom {
         pipeline: Arc<CachedPipeline>,
@@ -341,6 +346,46 @@ impl TensorOp {
     #[inline]
     pub fn empty() -> Self {
         Self::List(vec![])
+    }
+
+    /// GPU-side argmax sampling - returns token index without reading back full logits.
+    /// - `x` shape: `[C, T, B]` - input logits (vocab_size, num_tokens, batch)
+    /// - `output` shape: `[T, B, 1, 1]` - output token indices
+    /// This avoids reading back 260KB of logits per token (65K vocab × 4 bytes).
+    pub fn sample_argmax(
+        x: &TensorGpu<impl Float, ReadWrite>,
+        output: &TensorGpu<u32, ReadWrite>,
+    ) -> Result<Self, TensorError> {
+        const BLOCK_SIZE: u32 = 128;
+
+        let context = x.context();
+        let shape = x.shape();
+
+        // Validate shapes
+        output.check_shape([shape[1], shape[2], 1, 1])?;
+
+        let key = PipelineKey::new(
+            "sample_argmax",
+            "sample_argmax",
+            Macros::new().u32("BLOCK_SIZE", BLOCK_SIZE).tensor(x, None),
+        );
+
+        let pipeline = context.checkout_pipeline(
+            &key,
+            include_str!("../shaders/sample_argmax.wgsl"),
+            &[x.meta_layout(0), x.layout(1, true), output.layout(2, false)],
+        );
+        let bindings = vec![BindGroupBuilder::new(&key, context, &pipeline.layout)
+            .bind_meta(0, x)
+            .bind(1, x)
+            .bind(2, output)
+            .build()];
+
+        Ok(Self::Atom {
+            pipeline,
+            bindings,
+            dispatch: [1, shape[1] as u32, shape[2] as u32],
+        })
     }
 
     /// Softmax operator applied on `x`.
